@@ -13,6 +13,7 @@ Outputs to:
 """
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.request
@@ -20,11 +21,12 @@ import urllib.error
 from pathlib import Path
 
 from .runner import run_oracle
-from ..db import connect
+from ..db import connect, get_function
 from .render import build_oracle_prompt
 from .agent import generate_with_agent
 from .compile import write_compile_script, compile_oracle
 from .notes import extract_oracle_notes, save_notes
+from .pdb_selector import select_pdb, catalog_note, pdb_path as make_pdb_path
 from ..ollama import generate_url
 
 OLLAMA_URL    = "http://localhost:11434/api/generate"  # kept for reference
@@ -113,7 +115,24 @@ def generate_one(
     oracle_out.mkdir(parents=True, exist_ok=True)
     oracle_cc_path = oracle_out / "oracle.cc"
 
-    oracle_code, trace = generate_with_agent(conn, function_qname, model, oracle_out=oracle_out, verbose=verbose)
+    # Select the most appropriate example PDB for this function.
+    fn_row = get_function(conn, function_qname)
+    pdb_file, pdb_certain = select_pdb(
+        function_qname,
+        source_code=fn_row["source_code"] or "" if fn_row else "",
+        doc_comment=fn_row["comment"] or "" if fn_row else "",
+    )
+    pdb_note = "" if pdb_certain else catalog_note(selected_file=pdb_file)
+    if pdb_certain:
+        print(f"[pdb] auto-selected {pdb_file} for {function_qname}")
+    else:
+        print(f"[pdb] using default {pdb_file} for {function_qname} (LLM may choose another)")
+
+    oracle_code, trace = generate_with_agent(
+        conn, function_qname, model,
+        oracle_out=oracle_out, verbose=verbose,
+        pdb_file=pdb_file, pdb_note=pdb_note,
+    )
     (oracle_out / "agent_trace.txt").write_text(trace)
     if oracle_code is None:
         return None
@@ -148,6 +167,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate an oracle.cc for a function")
     parser.add_argument("function", help="Fully-qualified function name")
     parser.add_argument("--model",       default=DEFAULT_MODEL, help="Ollama model")
+    parser.add_argument("--backend",     default="ollama", choices=["ollama", "openai"],
+                        help="LLM backend (default: ollama)")
+    parser.add_argument("--no-thinking", action="store_true",
+                        help="Disable reasoning/thinking output (sets CT_THINK=0)")
     parser.add_argument("--dry-run",     action="store_true",
                         help="Print the prompt without calling the LLM")
     parser.add_argument("--second-pass", action="store_true",
@@ -156,10 +179,21 @@ def main() -> None:
                         help="Print thinking and tool calls to the console")
     args = parser.parse_args()
 
+    os.environ["CT_BACKEND"] = args.backend
+    if args.no_thinking:
+        os.environ["CT_THINK"] = "0"
+
     conn = connect()
 
     if args.dry_run:
-        prompt = build_oracle_prompt(conn, args.function)
+        fn_row = get_function(conn, args.function)
+        pdb_file, pdb_certain = select_pdb(
+            args.function,
+            source_code=fn_row["source_code"] or "" if fn_row else "",
+            doc_comment=fn_row["comment"] or "" if fn_row else "",
+        )
+        pdb_note = "" if pdb_certain else catalog_note(selected_file=pdb_file)
+        prompt = build_oracle_prompt(conn, args.function, pdb_file=pdb_file, pdb_note=pdb_note)
         conn.close()
         if prompt is None:
             print(f"Function not found in DB: {args.function}", file=sys.stderr)

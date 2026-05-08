@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from .agent import OLLAMA_CHAT_URL
+from ..ollama import chat_url
 
 NOTES_SCHEMA_KEYS = (
     "construction",
@@ -60,7 +60,7 @@ def _chat(messages: list[dict], model: str) -> str:
         "stream":   False,
         "think":    False,
     }).encode()
-    req = urllib.request.Request(OLLAMA_CHAT_URL, data=payload,
+    req = urllib.request.Request(chat_url(), data=payload,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=300) as resp:
         data = json.loads(resp.read())

@@ -66,11 +66,15 @@ def _run_hook(cmd_template: str, out_dir: Path) -> tuple[bool, str]:
         oracle = out_dir / "oracle" / "oracle.cc",
         second = out_dir / "oracle" / "oracle_second_pass.cc",
     )
-    proc = subprocess.run(
-        shlex.split(cmd),
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            shlex.split(cmd),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"[_run_hook] timed out after 300s: {cmd}"
     output = (proc.stdout + proc.stderr).strip()
     return proc.returncode == 0, output
 

@@ -61,6 +61,10 @@ Rules:
 4. Add a main() that calls RUN_ALL_TESTS().
 5. Remove all INPUT/OUTPUT std::cout lines — assertions only.
 
+Accessing private/protected members:
+   test.cc is compiled with `-fno-access-control`. You can call any private
+   or protected method and read/write any private/protected member directly.
+
 Mandatory steps before outputting the final program:
 6. Call resolve_includes on your draft FIRST to verify every #include "..."
    header resolves correctly. Fix any that do not.
@@ -353,7 +357,15 @@ def generate_test_with_agent(
     def _is_usable(code: str | None) -> bool:
         return bool(code and len(code) > 100 and "#include" in code)
 
+    def _progress(label: str, tool_calls: list) -> None:
+        if tool_calls:
+            names = ", ".join(tc.get("function", {}).get("name", "?") for tc in tool_calls)
+            print(f"  [test] {label} → {names}", flush=True)
+        else:
+            print(f"  [test] {label} → done (final answer)", flush=True)
+
     for turn in range(20):
+        print(f"  [test] turn {turn + 1}/20 ...", end="", flush=True)
         data = _chat(messages, model, TEST_TOOLS)
         msg  = data.get("message", {})
         tool_calls        = msg.get("tool_calls") or []
@@ -377,8 +389,11 @@ def generate_test_with_agent(
         # the response window — abort the loop and let rescue fire clean.
         degen, diag = _is_degenerate_thinking(thinking)
         if degen:
+            print(f"\r  [test] turn {turn + 1}/20 → DEGENERATE — aborting", flush=True)
             trace_lines.append(f"[agent] {diag} — aborting loop, will issue rescue.\n")
             break
+
+        _progress(f"turn {turn + 1}/20", tool_calls)
 
         if not tool_calls:
             trace_lines.append(
@@ -409,6 +424,7 @@ def generate_test_with_agent(
         messages.append({"role": "user",
                          "content": _EXTENSION_PROMPT.format(n=_EXTENSION_TURNS)})
 
+        print(f"  [test] extension check ...", end="", flush=True)
         data = _chat(messages, model, TEST_TOOLS)
         msg  = data.get("message", {})
         tool_calls        = msg.get("tool_calls") or []
@@ -421,15 +437,18 @@ def generate_test_with_agent(
             trace_lines.append(f"[thinking — extension]\n{textwrap.indent(thinking, '  ')}\n")
 
         if not tool_calls:
+            print(f"\r  [test] extension check → declined", flush=True)
             trace_lines.append(
                 f"[assistant — final (declined extension)]\n{textwrap.indent(assistant_content, '  ')}\n"
             )
             test_code = _extract_code(assistant_content)
         else:
+            print(f"\r  [test] extension check → granted", flush=True)
             trace_lines.append(f"[agent] Extension granted ({_EXTENSION_TURNS} more turns).\n")
             messages.extend(_run_tool_calls(tool_calls))
 
             for ext_turn in range(_EXTENSION_TURNS):
+                print(f"  [test] ext turn {ext_turn + 1}/{_EXTENSION_TURNS} ...", end="", flush=True)
                 data = _chat(messages, model, TEST_TOOLS)
                 msg  = data.get("message", {})
                 tool_calls        = msg.get("tool_calls") or []
@@ -442,6 +461,8 @@ def generate_test_with_agent(
                     trace_lines.append(
                         f"[thinking — ext turn {ext_turn + 1}]\n{textwrap.indent(thinking, '  ')}\n"
                     )
+
+                _progress(f"ext turn {ext_turn + 1}/{_EXTENSION_TURNS}", tool_calls)
 
                 if not tool_calls:
                     trace_lines.append(

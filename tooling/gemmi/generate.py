@@ -8,6 +8,7 @@ from pathlib import Path
 from ..db import connect, get_function
 from .compile import compile_gemmi, run_gemmi_test_binary, write_compile_script
 from .agent import _dep_extra_includes, _dep_extra_sources
+from .commit import commit_gemmi_port
 
 DEFAULT_MODEL = "qwen3.6"
 
@@ -29,6 +30,7 @@ def generate_gemmi(
     model: str = DEFAULT_MODEL,
     verbose: bool = False,
     conn: sqlite3.Connection | None = None,
+    commit: bool = False,
 ) -> Path:
     """Emit oracle_dir/gemmi/{function.hh, [function.cc], test.cc}.
 
@@ -118,4 +120,16 @@ def generate_gemmi(
         extra_includes=dep_includes,
         extra_sources=dep_sources,
     )
+
+    if commit:
+        print(f"[gemmi] Committing port for {function_qname}...")
+        _commit_conn = conn or connect()
+        try:
+            commit_gemmi_port(_commit_conn, function_qname, oracle_dir / "gemmi")
+        except Exception as e:
+            print(f"[gemmi] Warning: git commit failed — {e}")
+        finally:
+            if conn is None:
+                _commit_conn.close()
+
     return test_cc

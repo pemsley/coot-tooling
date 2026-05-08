@@ -32,14 +32,14 @@ from pathlib import Path
 
 from ..db import DB_PATH
 from ..oracle.agent import (
-    OLLAMA_CHAT_URL,
-    OLLAMA_OPTIONS,
     _tool_read_file,
     _tool_grep_codebase,
     _tool_lookup_type,
     _tool_find_symbol,
     _is_degenerate_thinking,
 )
+from ..llm import SAMPLING_PARAMS, OLLAMA_CONTEXT_TOKENS, OLLAMA_MAX_TOKENS
+from ..ollama import chat_url
 from ..oracle.compile import GEMMI_INCLUDE
 from .agent import GEMMI_CHEAT_SHEET
 
@@ -201,16 +201,21 @@ def _stream_chat(
     In verbose mode, thinking tokens are also printed with a dim prefix.
     Tool calls are always printed when they arrive.
     """
+    ollama_options = {
+        "num_ctx": OLLAMA_CONTEXT_TOKENS,
+        "num_predict": OLLAMA_MAX_TOKENS,
+        **SAMPLING_PARAMS,
+    }
     payload = json.dumps({
         "model":    model,
         "messages": messages,
         "tools":    tools,
         "stream":   True,
         "think":    True,
-        "options":  OLLAMA_OPTIONS,
+        "options":  ollama_options,
     }).encode()
     req = urllib.request.Request(
-        OLLAMA_CHAT_URL,
+        chat_url(),
         data=payload,
         headers={"Content-Type": "application/json"},
     )

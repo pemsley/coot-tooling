@@ -7,14 +7,23 @@ from pathlib import Path
 from .results import OracleResult, parse_output, save_result
 
 
+RUN_TIMEOUT_SECONDS = 300
+
+
 def run_binary(binary: Path, args: list[str] | None = None, cwd: Path | None = None) -> tuple[int, str, str]:
     """Run a binary, return (returncode, stdout, stderr)."""
-    result = subprocess.run(
-        [str(binary.absolute())] + (args or []),
-        capture_output=True,
-        text=True,
-        cwd=str(cwd) if cwd else str(binary.parent),
-    )
+    try:
+        result = subprocess.run(
+            [str(binary.absolute())] + (args or []),
+            capture_output=True,
+            text=True,
+            cwd=str(cwd) if cwd else str(binary.parent),
+            timeout=RUN_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return -1, stdout, stderr + f"\n[run_binary] timed out after {RUN_TIMEOUT_SECONDS}s"
     return result.returncode, result.stdout, result.stderr
 
 

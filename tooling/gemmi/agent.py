@@ -55,10 +55,15 @@ _GEMMI_NO_COMPILE_NUDGE = (
 )
 from ..oracle.compile import GEMMI_INCLUDE
 from ..oracle.notes import load_notes, render_notes_for_prompt
-from .compile import MAX_COMPILE_ATTEMPTS, compile_gemmi, run_gemmi_test_binary
+from .compile import (
+    MAX_COMPILE_ATTEMPTS, compile_gemmi, run_gemmi_test_binary,
+    write_compile_script,
+)
 from .lint import gemmi_lint, lint_report
 from .cheat_lookup import mmdb_to_gemmi, include_for_symbol
 from ..oracle.generate import OUT_ROOT, sanitize_name
+
+_GEMMI_NO_COMPILE_AFTER = 10
 
 # Absolute paths to data files (pdb/cif/mtz/map/ent) inside the original test
 # source. These fixtures are validated by the oracle stage and MUST carry over
@@ -74,7 +79,7 @@ _FIXTURE_PATH_RE = re.compile(r'"(/[^"\s]+\.(?:pdb|cif|mmcif|ent|mtz|map))"')
 _PARENT_ACCESS_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"->\s*chain\b"),                # mmdb::Residue::chain (Chain*)
     re.compile(r"->\s*GetChainID\s*\("),        # any -> chain ID accessor
-    re.compile(r"->\s*GetChain\s*\("),          # atom->GetChain()
+    re.compile(r"->\s*GetChain\s*\(\s*\)"),      # atom->GetChain() — zero-arg parent accessor
     re.compile(r"\batom\s*->\s*residue\b"),     # mmdb::Atom::residue
     re.compile(r"->\s*GetResidue\s*\(\s*\)"),   # zero-arg -> parent residue
 ]
@@ -188,6 +193,12 @@ Headers you will almost certainly need:
 
 Loading a PDB — this is the only idiom that works:
   gemmi::Structure st = gemmi::read_pdb_file("/abs/path/to/file.pdb");
+  // read_pdb_file DOES retain hydrogen atoms — element.is_hydrogen() returns
+  // true for H atoms parsed from column 77-78 of the PDB ATOM record.
+  // If your count is 0, the bug is in your code, not the file:
+  //   ✅ atom.element.is_hydrogen()   ← correct
+  //   ❌ atom.name == "H"             ← wrong (name is " H  ", "HA", "HB3"…)
+  // grep_codebase does NOT search test-data/ — use read_file to inspect fixtures.
 
 Traversal — every level is a std::vector, so you iterate, not GetXxx():
   for (gemmi::Model&   model   : st.models)
@@ -222,6 +233,11 @@ NeighborSearch — distance queries against a Model:
       gemmi::CRA cra = m->to_cra(st.models[0]);   // gives chain/residue/atom
       // cra.chain, cra.residue, cra.atom are POINTERS (may be nullptr)
   }
+  // find_atoms takes `const Position&`, NOT `Vec3`. Position derives from Vec3
+  // but the conversion is EXPLICIT — passing a bare Vec3 fails to compile:
+  //   ❌ ns.find_atoms(some_vec3, ...)              // no viable conversion
+  //   ✅ ns.find_atoms(gemmi::Position(some_vec3), ...)
+  //   ✅ ns.find_atoms(atom.pos, ...)               // atom.pos is already Position
 
 ContactSearch — pairs of atoms within a radius:
   gemmi::ContactSearch cs(/*search_radius=*/4.0);
@@ -236,6 +252,11 @@ CRA shape (gemmi/model.hpp):
   struct CRA { Chain* chain; Residue* residue; Atom* atom; };  // ALL POINTERS
 
 There is NO top-level <gemmi.hpp>. There is NO atom.get_pos() or st.n_atoms().
+To count atoms in a Structure use the free function (NOT a method on Structure):
+  #include <gemmi/calculate.hpp>
+  size_t total = gemmi::count_atom_sites(st);   // works for Structure/Model/Chain/Residue
+  // ❌ st.n_atoms() / st.count_atom_sites()  — neither exists
+  // ✅ Manual fallback: nested for-loops summing residue.atoms.size()
 Vec3 operator* is component-wise; for dot product use v.dot(w); for squared
 length use v.length_sq().
 
@@ -375,10 +396,11 @@ translating its Google Test, in the same session.
    Alternatively, call compile_gemmi directly to pass all contents at once.
    If tests FAIL, fix and rewrite the affected file(s) to recompile.
    Max {MAX_COMPILE_ATTEMPTS} compile attempts total.
-9. **Be decisive.** Once you have reasoned through an API question once, do
-   not repeat that reasoning. Write your best draft immediately — do not
-   re-analyse what you already concluded. Compiler errors are faster feedback
-   than further speculation.
+9. **Compile early and often.** Look up at most 3–4 APIs, then call
+   compile_gemmi with your best draft — do not wait until you are certain.
+   Compiler errors are faster feedback than further API research. Once you
+   have reasoned through an API question, do not revisit it; act on your
+   conclusion immediately.
 
 {GEMMI_ANTIPATTERNS}
 
@@ -678,17 +700,25 @@ def _make_tool_handlers(
                 cc_path.unlink()
             fn_cc_arg = None
 
+        write_compile_script(
+            gemmi_subdir,
+            has_function_cc=fn_cc_arg is not None,
+            extra_includes=extra_includes,
+            extra_sources=extra_sources,
+        )
+
         test_bin = gemmi_subdir / "test_check"
         success, output = compile_gemmi(
             test_path, test_bin, fn_cc_arg, extra_includes, extra_sources,
         )
 
-        error_log = gemmi_subdir / "compile_error.log"
-        error_log.write_text(output)
+        compile_log = gemmi_subdir / "compile.log"
+        compile_log.write_text(output)
         output = _summarise_compile_output(output)
         if success:
             last_binary[0] = test_bin
             run_ok, run_out = run_gemmi_test_binary(test_bin)
+            (gemmi_subdir / "run.log").write_text(run_out)
             run_lines = run_out.splitlines()
             if len(run_lines) > 100:
                 run_out = "\n".join(run_lines[:100]) + f"\n... ({len(run_lines) - 100} more lines)"
@@ -698,7 +728,7 @@ def _make_tool_handlers(
                 f"{status}\n{run_out}"
             )
         last_binary[0] = None
-        last_error_log[0] = error_log
+        last_error_log[0] = compile_log
         return f"Compilation FAILED (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS}):\n{output}"
 
     def run_handler() -> str:
@@ -743,6 +773,32 @@ _BLOCK_RE = re.compile(
     r"```(?:cpp|c\+\+)?(?::([^\n]+))?\n(.*?)```",
     re.DOTALL,
 )
+
+
+def _extract_drafts_from_thinking(thinking: str) -> dict[str, str]:
+    """Salvage a draft from `thinking` when the stream aborted before
+    `assistant_content` got a chance to be produced.
+
+    Models often write multiple complete drafts inside a thinking block before
+    going degenerate. We can't rely on labelled fences here (thinking blocks
+    typically use bare ```cpp), so we fingerprint each block by content and
+    keep the LAST one of each kind. Iteration is in document order, so later
+    matches naturally overwrite earlier ones — i.e. the most refined draft wins.
+    """
+    found: dict[str, str] = {}
+    for _label, body in _BLOCK_RE.findall(thinking):
+        body = body.strip()
+        if not body:
+            continue
+        # test.cc must be checked first: it usually `#include`s function.hh too,
+        # so a naive function.cc check would steal it.
+        if "TEST(" in body and "<gtest/gtest.h>" in body:
+            found["test.cc"] = body
+        elif "#pragma once" in body:
+            found["function.hh"] = body
+        elif '#include "function.hh"' in body and "{" in body and "}" in body:
+            found["function.cc"] = body
+    return found
 
 
 def _extract_blocks(content: str) -> dict[str, str]:
@@ -810,7 +866,7 @@ def generate_gemmi_port_with_agent(
             return _tool_grep_codebase(
                 args["pattern"],
                 args.get("glob"),
-                extra_roots=[GEMMI_INCLUDE],
+                extra_roots=[GEMMI_INCLUDE, OUT_ROOT.parent / "test-data"],
             )
         return _dispatch(conn, name, args)
 
@@ -966,6 +1022,8 @@ def generate_gemmi_port_with_agent(
     no_compile_warned = [False]
     degen_recovered = [False]
     compile_intent_strikes = [0]
+    non_compile_tool_calls = [0]
+    no_tool_nudge_sent = [False]
 
     def _save_draft_from_compile(args: dict, compile_result: str) -> None:
         # Only save when the compile + test run actually succeeded — otherwise
@@ -1034,6 +1092,10 @@ def generate_gemmi_port_with_agent(
             # fallback, which then fails again at verify time.
             if name == "compile_gemmi":
                 _save_draft_from_compile(args, result_text)
+            if name in ("compile_gemmi", "write_gemmi_file", "run_gemmi_test"):
+                non_compile_tool_calls[0] = 0
+            else:
+                non_compile_tool_calls[0] += 1
             result_lines = result_text.splitlines()
             if len(result_lines) > 150:
                 result_text = ("\n".join(result_lines[:150])
@@ -1053,7 +1115,15 @@ def generate_gemmi_port_with_agent(
         return ("function.hh" in blocks and "test.cc" in blocks
                 and "#include" in blocks["test.cc"])
 
-    for turn in range(25):
+    def _progress(label: str, tool_calls: list) -> None:
+        if tool_calls:
+            names = ", ".join(tc.get("function", {}).get("name", "?") for tc in tool_calls)
+            print(f"\r  [gemmi] {label} → {names}", flush=True)
+        else:
+            print(f"\r  [gemmi] {label} → done (final answer)", flush=True)
+
+    for turn in range(50):
+        print(f"  [gemmi] turn {turn + 1}/50 ...", end="", flush=True)
         data = _chat(messages, model, GEMMI_TOOLS)
         msg  = data.get("message", {})
         tool_calls        = msg.get("tool_calls") or []
@@ -1070,10 +1140,12 @@ def generate_gemmi_port_with_agent(
         degen, diag = _is_degenerate_thinking(thinking)
         if degen:
             if degen_recovered[0]:
+                print(f"\r  [gemmi] turn {turn + 1}/50 → DEGENERATE — aborting", flush=True)
                 trace_lines.append(
                     f"[agent] {diag} — second degeneracy, aborting.\n"
                 )
                 break
+            print(f"\r  [gemmi] turn {turn + 1}/50 → DEGENERATE — forcing compile", flush=True)
             degen_recovered[0] = True
             trace_lines.append(f"[agent] {diag} — forcing compile and continuing.\n")
 
@@ -1083,6 +1155,17 @@ def generate_gemmi_port_with_agent(
                 messages.extend(_run_tool_calls(tool_calls))
 
             draft = last_draft[0]
+            # No compiled draft yet — try to salvage one from the thinking
+            # block. Models often write complete drafts in their scratchpad
+            # before going degenerate; those drafts are otherwise discarded.
+            if not draft:
+                salvaged = _extract_drafts_from_thinking(thinking)
+                if "function.hh" in salvaged and "test.cc" in salvaged:
+                    trace_lines.append(
+                        f"[agent] Salvaged draft from thinking: "
+                        f"{sorted(salvaged.keys())}\n"
+                    )
+                    draft = salvaged
             if draft:
                 compile_result = compile_handler(
                     draft["function.hh"],
@@ -1112,9 +1195,40 @@ def generate_gemmi_port_with_agent(
             trace_lines.append(f"[degen-recovery]\n{textwrap.indent(recovery_msg, '  ')}\n")
             continue
 
+        _progress(f"turn {turn + 1}/50", tool_calls)
+
         if not tool_calls:
+            # If thinking expressed compile intent but the model produced no tool
+            # calls AND no usable fenced output, force a compile from the last draft
+            # rather than exiting — the model talked itself into compiling but then
+            # stalled before making the call.
+            extracted = _extract_blocks(assistant_content) or None
+            if (_has_compile_intent(thinking)
+                    and not _is_usable(extracted)
+                    and last_draft[0]
+                    and not degen_recovered[0]):
+                draft = last_draft[0]
+                compile_result = compile_handler(
+                    draft["function.hh"],
+                    draft["test.cc"],
+                    draft.get("function.cc"),
+                )
+                trace_lines.append(
+                    f"[agent] Compile intent with no tool calls — forced compile:\n"
+                    f"{textwrap.indent(compile_result, '  ')}\n"
+                )
+                recovery_msg = (
+                    "You expressed intent to compile but made no tool calls. "
+                    f"Your last draft has been compiled automatically:\n\n{compile_result}\n\n"
+                    "If all tests passed: output the final fenced code blocks immediately. "
+                    "If tests failed: fix only the specific errors shown, then rewrite the "
+                    "affected file(s) with write_gemmi_file. Do NOT re-examine any APIs."
+                )
+                messages.append({"role": "user", "content": recovery_msg})
+                trace_lines.append(f"[intent-no-tool-recovery]\n{textwrap.indent(recovery_msg, '  ')}\n")
+                continue
             trace_lines.append(f"[assistant — final]\n{textwrap.indent(assistant_content, '  ')}\n")
-            final_blocks = _extract_blocks(assistant_content) or None
+            final_blocks = extracted
             break
         trace_lines.append(f"[assistant — turn {turn + 1}, {len(tool_calls)} tool call(s)]")
         messages.extend(_run_tool_calls(tool_calls))
@@ -1134,7 +1248,7 @@ def generate_gemmi_port_with_agent(
                 f"[agent] compile-intent strike {compile_intent_strikes[0]} "
                 f"(thinking expressed intent but no compile_gemmi call).\n"
             )
-            if compile_intent_strikes[0] >= 2 and last_draft[0]:
+            if compile_intent_strikes[0] >= 1 and last_draft[0]:
                 draft = last_draft[0]
                 compile_result = compile_handler(
                     draft["function.hh"],
@@ -1156,12 +1270,19 @@ def generate_gemmi_port_with_agent(
                 trace_lines.append(f"[intent-recovery]\n{textwrap.indent(recovery_msg, '  ')}\n")
                 compile_intent_strikes[0] = 0
 
-        if (NO_COMPILE_AFTER and not no_compile_warned[0]
-                and (turn + 1) >= NO_COMPILE_AFTER
+        if (not no_compile_warned[0]
                 and not any(k.startswith("compile_gemmi:") for k in call_counts)):
-            messages.append({"role": "user", "content": _GEMMI_NO_COMPILE_NUDGE})
-            trace_lines.append(f"[no-compile nudge — turn {turn + 1}]\n{textwrap.indent(_GEMMI_NO_COMPILE_NUDGE, '  ')}\n")
-            no_compile_warned[0] = True
+            turn_fired = (_GEMMI_NO_COMPILE_AFTER and (turn + 1) >= _GEMMI_NO_COMPILE_AFTER)
+            tool_fired = (not no_tool_nudge_sent[0] and non_compile_tool_calls[0] >= 10)
+            if turn_fired or tool_fired:
+                messages.append({"role": "user", "content": _GEMMI_NO_COMPILE_NUDGE})
+                trace_lines.append(
+                    f"[no-compile nudge — turn {turn + 1}, "
+                    f"reason={'turn-limit' if turn_fired else 'tool-count'}]\n"
+                    f"{textwrap.indent(_GEMMI_NO_COMPILE_NUDGE, '  ')}\n"
+                )
+                no_compile_warned[0] = True
+                no_tool_nudge_sent[0] = True
 
         if NUDGE_EVERY_N_TURNS and (turn + 1) % NUDGE_EVERY_N_TURNS == 0:
             messages.append({"role": "user", "content": _GEMMI_NUDGE})

@@ -28,8 +28,9 @@ def caller_class_fields(conn: sqlite3.Connection, caller_qname: str) -> str | No
     caller_qname, grouped by access level.
 
     All fields (public, protected, private) are shown so the agent knows the
-    names available via `#define private public`. Methods are filtered out —
-    only data members survive. Returns None if there are no fields.
+    names available — oracle.cc is compiled with -fno-access-control and can
+    touch any of them. Methods are filtered out — only data members survive.
+    Returns None if there are no fields.
     """
     cls = get_containing_class(conn, caller_qname)
     if not cls or not cls["summary"]:
@@ -107,15 +108,28 @@ INCLUDE_ROOTS = [
     "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal/include"
 ]
 
-_TEST_DATA_DIR = Path(__file__).parent.parent / "test-data"
+_TEST_DATA_DIR = Path(__file__).parent.parent.parent / "test-data"
 
-ORACLE_INSTRUCTIONS = f"""\
+
+def make_oracle_instructions(pdb_path: str, pdb_note: str = "") -> str:
+    """Build the ORACLE_INSTRUCTIONS block with the given PDB path.
+
+    pdb_note is injected after the PDB line when the choice was ambiguous —
+    it lists all available PDB files so the LLM can override the default.
+    """
+    pdb_line = f"       PDB: {pdb_path}"
+    if pdb_note:
+        pdb_line += (
+            "\n       (or choose a more appropriate file from the list below —\n"
+            f"        the selected path is only a default)\n{pdb_note}"
+        )
+    return f"""\
 Write a complete, compilable C++ program (oracle.cc) that observes the inputs
 and outputs of the function marked FUNCTION TO OBSERVE below.
 
 Requirements:
   1. Be self-contained — hardcode the test file paths below, do not use argc/argv.
-       PDB: {_TEST_DATA_DIR}/example.pdb
+{pdb_line}
        MTZ: {_TEST_DATA_DIR}/example.mtz
   2. Load the structure using the hardcoded path.
   3. Navigate the structure to reach a valid receiver/input for the function.
@@ -124,19 +138,22 @@ Requirements:
        INPUT  <name>: <value>
        OUTPUT <name>: <value>
 
-ACCESS RULES (oracle.cc is EXTERNAL client code — not a member of any class):
-  * You may only call PUBLIC methods and read PUBLIC fields.
-  * Members under `private:` or `protected:` are hidden from the context below,
-    or marked "non-public members hidden". Do not invent accesses to them.
-  * EXAMPLE CALLERS marked "[in-class caller]" are member functions of the
-    same class, so they legitimately touch private state. Do NOT copy that
-    private access pattern into oracle.cc — use the public API instead
-    (look for a public getter/setter/accessor, or construct the object
-    through a public factory that initialises the state for you).
+ACCESS RULES (oracle.cc is compiled with `-fno-access-control`):
+  * You may call ANY method (public, protected, or private) and read or write
+    ANY field on any object. C++ access checks are disabled for oracle.cc.
+  * Prefer the public API where one exists — it is usually cleaner — but if
+    a private method or member is the most direct way to set up or observe
+    behaviour, just call it directly.
+  * Private/protected members may be hidden from the terse type summaries
+    below. Use `lookup_type` or `read_file` to inspect them when needed.
 
 Use the EXAMPLE CALLERS to understand how the function is typically invoked and
 what objects are needed. Only use types and methods shown in the context below.\
 """
+
+
+# Backward-compat constant used by external code that imports ORACLE_INSTRUCTIONS.
+ORACLE_INSTRUCTIONS = make_oracle_instructions(str(_TEST_DATA_DIR / "example.pdb"))
 
 
 def _to_include(path: str) -> str:
@@ -153,18 +170,26 @@ def _short_name(qname: str) -> str:
 OVERRIDES_DIR = Path(__file__).parent / "overrides"
 
 
-def _load_override(type_qname: str) -> str | None:
+def _load_override(type_qname: str, pdb_path: str | None = None) -> str | None:
     """Return the contents of an override file for type_qname, or None.
 
     Files are named by replacing '::' with '__', e.g.:
       molecules_container_t       → overrides/molecules_container_t.cc
       mmdb::Residue               → overrides/mmdb__Residue.cc
+
+    pdb_path: full path to the example PDB file to substitute for @PDB_PATH@.
+    Falls back to the default example.pdb when None.
     """
     stem = type_qname.replace("::", "__")
     path = OVERRIDES_DIR / f"{stem}.cc"
-    if path.exists():
-        return path.read_text().replace("@TEST_DATA_DIR@", str(_TEST_DATA_DIR))
-    return None
+    if not path.exists():
+        return None
+    resolved_pdb = pdb_path or str(_TEST_DATA_DIR / "example.pdb")
+    return (
+        path.read_text()
+        .replace("@TEST_DATA_DIR@", str(_TEST_DATA_DIR))
+        .replace("@PDB_PATH@", resolved_pdb)
+    )
 
 
 def _render_type(
@@ -289,7 +314,12 @@ def _extract_return_type(source_code: str, function_qname: str) -> str:
     return raw.strip()
 
 
-def build_oracle_prompt(conn: sqlite3.Connection, function_qname: str) -> str | None:
+def build_oracle_prompt(
+    conn: sqlite3.Connection,
+    function_qname: str,
+    pdb_file: str = "example.pdb",
+    pdb_note: str = "",
+) -> str | None:
     fn = get_function(conn, function_qname)
     if not fn:
         return None
@@ -363,7 +393,8 @@ def build_oracle_prompt(conn: sqlite3.Connection, function_qname: str) -> str | 
     # A hand-curated override file takes precedence over the automated DB lookup.
     if containing_class:
         cls_qname = containing_class["qualified_name"]
-        override = _load_override(cls_qname)
+        full_pdb_path = str(_TEST_DATA_DIR / pdb_file)
+        override = _load_override(cls_qname, pdb_path=full_pdb_path)
         if override:
             section(f"`{cls_qname}` construction (curated)", override)
         else:
@@ -472,4 +503,5 @@ def build_oracle_prompt(conn: sqlite3.Connection, function_qname: str) -> str | 
 
     context_block = "\n\n".join(parts)
 
-    return f"{ORACLE_INSTRUCTIONS}\n\n{context_block}\n"
+    instructions = make_oracle_instructions(str(_TEST_DATA_DIR / pdb_file), pdb_note)
+    return f"{instructions}\n\n{context_block}\n"

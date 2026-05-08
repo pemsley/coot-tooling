@@ -7,7 +7,7 @@
 // Do NOT set udd_atom_index_handle or other private fields manually —
 // they are populated as a side-effect of construction.
 mmdb::Manager *mol = new mmdb::Manager();
-mol->ReadCoorFile("@TEST_DATA_DIR@/example.pdb");
+mol->ReadCoorFile("@PDB_PATH@");
 
 std::vector<std::pair<bool, mmdb::Residue *>> residues_vec;
 int nModels = mol->GetNumberOfModels();

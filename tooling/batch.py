@@ -28,20 +28,146 @@ Usage (file mode):
 from __future__ import annotations
 
 import argparse
+import os
 import queue
 import sys
+import threading
 import traceback
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+
+# Per-function wall-clock budget. Even with every subprocess and HTTP call
+# bounded individually, an agent loop can still chew through hours if every
+# turn happens to take its full timeout. Anything longer than this is
+# almost certainly a stuck function — skip it and move on.
+FUNCTION_DEADLINE_SECONDS = int(os.environ.get("CT_FUNCTION_DEADLINE", "1800"))
+
+
+# ── observability ─────────────────────────────────────────────────────────────
+
+# Per-worker live status. Keyed by thread name. Values: (qname, stage, started_at).
+_worker_state: dict[str, tuple[str, str, float]] = {}
+_worker_state_lock = threading.Lock()
+
+
+def _set_worker_state(qname: str, stage: str) -> None:
+    import time as _t
+    with _worker_state_lock:
+        _worker_state[threading.current_thread().name] = (qname, stage, _t.monotonic())
+
+
+def _clear_worker_state() -> None:
+    with _worker_state_lock:
+        _worker_state.pop(threading.current_thread().name, None)
+
+
+class _Tee:
+    """Mirror writes to both an underlying stream and a log file."""
+
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log = log_file
+
+    def write(self, data: str) -> int:
+        n = self._stream.write(data)
+        try:
+            self._log.write(data)
+            self._log.flush()
+        except Exception:
+            pass
+        return n
+
+    def flush(self) -> None:
+        self._stream.flush()
+        try:
+            self._log.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _start_heartbeat(interval_s: int = 60) -> threading.Event:
+    """Spawn a daemon thread that prints per-worker state every interval_s."""
+    import time as _t
+    stop = threading.Event()
+
+    def _run():
+        while not stop.wait(interval_s):
+            ts = datetime.now().strftime("%H:%M:%S")
+            with _worker_state_lock:
+                snapshot = dict(_worker_state)
+            if not snapshot:
+                continue
+            for tname, (qname, stage, started) in sorted(snapshot.items()):
+                age = int(_t.monotonic() - started)
+                short = qname.rsplit("::", 1)[-1]
+                print(f"[{ts}] [heartbeat] {tname} stage={stage} fn={short} age={age}s",
+                      flush=True)
+
+    t = threading.Thread(target=_run, name="heartbeat", daemon=True)
+    t.start()
+    return stop
+
+
+def _install_batch_log(out_root: Path) -> None:
+    """Tee stdout/stderr into out_root/_batch.log so a stalled run leaves a trail."""
+    out_root.mkdir(parents=True, exist_ok=True)
+    log_path = out_root / "_batch.log"
+    log_file = open(log_path, "a", buffering=1)
+    log_file.write(f"\n=== batch start {datetime.now().isoformat(timespec='seconds')} "
+                   f"pid={os.getpid()} argv={sys.argv} ===\n")
+    sys.stdout = _Tee(sys.stdout, log_file)
+    sys.stderr = _Tee(sys.stderr, log_file)
+
+
+def _run_with_deadline(target, args_tuple, deadline_s: int, qname: str) -> "Result":
+    """Run target(*args_tuple) on a daemon thread; abandon it if it overruns.
+
+    On overrun the orphan thread is left running (Python can't kill threads),
+    but every subprocess and HTTP call it makes is now bounded, so it will
+    resolve eventually. Meanwhile the batch moves on.
+    """
+    box: dict = {}
+
+    def _runner():
+        try:
+            box["result"] = target(*args_tuple)
+        except BaseException as e:  # noqa: BLE001 — record any failure
+            box["error"] = e
+
+    t = threading.Thread(target=_runner, name=f"fn:{qname}", daemon=True)
+    t.start()
+    t.join(deadline_s)
+    if t.is_alive():
+        # Orphan worker may still be holding state — flag it so the heartbeat
+        # shows it's been abandoned rather than mid-stage.
+        with _worker_state_lock:
+            _worker_state[t.name] = (qname, "ABANDONED", _worker_state.get(t.name, (qname, "?", 0))[2])
+        r = Result(qname)
+        r.error = (
+            f"wall-clock deadline ({deadline_s}s) exceeded — abandoning "
+            "(orphan thread will resolve as bounded subprocesses unwind)"
+        )
+        return r
+    if "error" in box:
+        r = Result(qname)
+        r.error = f"unhandled exception: {box['error']}"
+        return r
+    return box["result"]
+
 from .db import connect, get_class_functions, get_file_functions, get_internal_call_deps
 from .oracle.generate import DEFAULT_MODEL, OUT_ROOT, generate_one, sanitize_name
 from .test.generate import generate_test
 from .gemmi.generate import generate_gemmi
 from .gemmi.aggregate import aggregate_gemmi_files
+from .gemmi.compile import run_gemmi_test_binary
 from .ollama import OLLAMA_HOSTS, set_host, get_host
+from .llm import OPENAI_HOSTS, set_openai_host
 
 
 # ── result tracking ───────────────────────────────────────────────────────────
@@ -110,10 +236,29 @@ def topo_waves(deps: dict[str, set[str]]) -> list[list[str]]:
 
 # ── per-function worker ───────────────────────────────────────────────────────
 
+def _gemmi_is_passing(out_dir: Path) -> bool:
+    """Return True if the gemmi test binary exists and all tests pass.
+
+    Checks run.log first (fast path). Falls back to executing the binary when
+    run.log is absent (e.g. functions processed before run.log was introduced).
+    """
+    run_log = out_dir / "gemmi" / "run.log"
+    if run_log.exists():
+        return "[  PASSED  ]" in run_log.read_text()
+    test_bin = out_dir / "gemmi" / "test_check"
+    if not test_bin.exists():
+        return False
+    ok, _ = run_gemmi_test_binary(test_bin)
+    return ok
+
+
 def _is_complete(out_dir: Path) -> bool:
-    """Return True if the function already has gemmi/function.hh and gemmi/test.cc."""
-    return (out_dir / "gemmi" / "function.hh").exists() and \
-           (out_dir / "gemmi" / "test.cc").exists()
+    """Return True if the function has gemmi files AND the test binary passes."""
+    return (
+        (out_dir / "gemmi" / "function.hh").exists()
+        and (out_dir / "gemmi" / "test.cc").exists()
+        and _gemmi_is_passing(out_dir)
+    )
 
 
 def _test_is_passing(out_dir: Path) -> bool:
@@ -131,6 +276,7 @@ def _process(
     skip_existing: bool,
     with_gemmi: bool = False,
     overwrite: bool = False,
+    commit: bool = False,
 ) -> Result:
     r = Result(qname)
     out_dir = OUT_ROOT / sanitize_name(qname)
@@ -153,11 +299,13 @@ def _process(
             f.write(line + "\n")
 
     log(f"START {qname} [ollama #{host_idx} — {host}]")
+    _set_worker_state(qname, "start")
 
     # ── completion check ──────────────────────────────────────────────────────
     if not overwrite and _is_complete(out_dir):
-        log("SKIP — already complete (gemmi/function.hh + gemmi/test.cc exist)")
+        log("SKIP — already complete (gemmi files present and test_check passes)")
         r.skipped = True
+        _clear_worker_state()
         return r
 
     # ── oracle phase ──────────────────────────────────────────────────────────
@@ -174,6 +322,7 @@ def _process(
         return r
     else:
         log("oracle: generating ...")
+        _set_worker_state(qname, "oracle")
         conn = connect()
         try:
             result_dir = generate_one(
@@ -204,6 +353,7 @@ def _process(
         r.test_ok = True
     else:
         log("test: generating ...")
+        _set_worker_state(qname, "test")
         try:
             generate_test(out_dir, model=model, agent=agent, verbose=verbose)
             log("test: ok")
@@ -217,8 +367,9 @@ def _process(
     # ── gemmi port phase (optional) ───────────────────────────────────────────
     if with_gemmi:
         log("gemmi: generating ...")
+        _set_worker_state(qname, "gemmi")
         try:
-            generate_gemmi(out_dir, qname, model=model, verbose=verbose)
+            generate_gemmi(out_dir, qname, model=model, verbose=verbose, commit=commit)
             log("gemmi: ok")
             r.gemmi_ok = True
         except Exception as e:
@@ -227,6 +378,7 @@ def _process(
             r.error = f"gemmi port failed: {e}"
 
     log(f"DONE oracle={r.oracle_ok} test={r.test_ok} gemmi={r.gemmi_ok}")
+    _clear_worker_state()
     return r
 
 
@@ -246,21 +398,43 @@ def _run_in_parallel(qnames: list[str], args, *, label: str = "") -> list[Result
         if hasattr(args, "with_gemmi")
         else not getattr(args, "no_gemmi", False)
     )
+    commit = getattr(args, "commit", False)
 
-    hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
-    host_queue: queue.Queue[str] = queue.Queue()
-    for h in hosts:
-        host_queue.put(h)
+    if args.backend == "openai":
+        openai_hosts = OPENAI_HOSTS
+        ollama_hosts = [OLLAMA_HOSTS[0]]  # dummy, won't be used
+    else:
+        openai_hosts = []
+        ollama_hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
+
+    ollama_host_queue: queue.Queue[str] = queue.Queue()
+    for h in ollama_hosts:
+        ollama_host_queue.put(h)
+
+    openai_host_queue: queue.Queue[str] = queue.Queue()
+    for h in openai_hosts:
+        openai_host_queue.put(h)
 
     def _process_with_host(qname: str) -> Result:
-        host = host_queue.get()
+        ollama_host = ollama_host_queue.get()
+        openai_host = None
         try:
-            set_host(host)
-            return _process(qname, args.model, args.agent, args.verbose,
-                            args.skip_oracle, args.skip_existing,
-                            with_gemmi, args.overwrite)
+            set_host(ollama_host)
+            if openai_hosts:
+                openai_host = openai_host_queue.get()
+                set_openai_host(openai_host)
+            return _run_with_deadline(
+                _process,
+                (qname, args.model, args.agent, args.verbose,
+                 args.skip_oracle, args.skip_existing,
+                 with_gemmi, args.overwrite, commit),
+                FUNCTION_DEADLINE_SECONDS,
+                qname,
+            )
         finally:
-            host_queue.put(host)
+            ollama_host_queue.put(ollama_host)
+            if openai_host is not None:
+                openai_host_queue.put(openai_host)
 
     out: list[Result] = []
     futures = {}
@@ -295,20 +469,43 @@ def _run_topo_waves(qnames: list[str], args) -> list[Result]:
         if hasattr(args, "with_gemmi")
         else not getattr(args, "no_gemmi", False)
     )
-    hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
-    host_queue: queue.Queue[str] = queue.Queue()
-    for h in hosts:
-        host_queue.put(h)
+    commit = getattr(args, "commit", False)
+
+    if args.backend == "openai":
+        openai_hosts = OPENAI_HOSTS
+        ollama_hosts = [OLLAMA_HOSTS[0]]  # dummy, won't be used
+    else:
+        openai_hosts = []
+        ollama_hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
+
+    ollama_host_queue: queue.Queue[str] = queue.Queue()
+    for h in ollama_hosts:
+        ollama_host_queue.put(h)
+
+    openai_host_queue: queue.Queue[str] = queue.Queue()
+    for h in openai_hosts:
+        openai_host_queue.put(h)
 
     def _process_with_host(qname: str) -> Result:
-        host = host_queue.get()
+        ollama_host = ollama_host_queue.get()
+        openai_host = None
         try:
-            set_host(host)
-            return _process(qname, args.model, args.agent, args.verbose,
-                            args.skip_oracle, args.skip_existing,
-                            with_gemmi, args.overwrite)
+            set_host(ollama_host)
+            if openai_hosts:
+                openai_host = openai_host_queue.get()
+                set_openai_host(openai_host)
+            return _run_with_deadline(
+                _process,
+                (qname, args.model, args.agent, args.verbose,
+                 args.skip_oracle, args.skip_existing,
+                 with_gemmi, args.overwrite, commit),
+                FUNCTION_DEADLINE_SECONDS,
+                qname,
+            )
         finally:
-            host_queue.put(host)
+            ollama_host_queue.put(ollama_host)
+            if openai_host is not None:
+                openai_host_queue.put(openai_host)
 
     # pending[q] = set of in-batch deps not yet completed
     pending: dict[str, set[str]] = {q: set(deps.get(q, set())) for q in qnames}
@@ -387,6 +584,10 @@ def main() -> None:
     parser.add_argument("--filter",        metavar="STR",  help="Only process methods whose name contains STR")
     parser.add_argument("--mmdb-only",     action="store_true", help="Only process methods that use MMDB types (mmdb::*)")
     parser.add_argument("--model",         default=DEFAULT_MODEL)
+    parser.add_argument("--backend",       default="ollama", choices=["ollama", "openai"],
+                        help="LLM backend (default: ollama)")
+    parser.add_argument("--no-thinking",   action="store_true",
+                        help="Disable reasoning/thinking output (sets CT_THINK=0)")
     parser.add_argument("--agent",         action="store_true",  help="Agentic mode for both oracle and test generation")
     parser.add_argument("--verbose",       action="store_true", help="Print thinking and tool calls to console")
     parser.add_argument("--skip-oracle",   action="store_true", help="Skip oracle generation if oracle.cc already exists; go straight to test generation")
@@ -401,6 +602,8 @@ def main() -> None:
                         help="Parallel workers (default 1)")
     parser.add_argument("--overwrite",     action="store_true",
                         help="Re-run all stages even if gemmi/function.hh + gemmi/test.cc already exist")
+    parser.add_argument("--commit",        action="store_true",
+                        help="Commit successful gemmi ports into the coot source tree")
     parser.add_argument("--list",          action="store_true", help="List matching methods and exit")
     args = parser.parse_args()
 
@@ -435,18 +638,38 @@ def main() -> None:
         print(f"\n{len(qnames)} methods")
         return
 
+    _install_batch_log(OUT_ROOT)
+    _start_heartbeat()
     print(f"Processing {len(qnames)} methods from {args.class_name} "
-          f"(model={args.model}, workers={args.workers}, agent={args.agent})")
+          f"(model={args.model}, backend={args.backend}, workers={args.workers}, agent={args.agent})")
+
+    os.environ["CT_BACKEND"] = args.backend
+    if args.no_thinking:
+        os.environ["CT_THINK"] = "0"
+
+    if args.backend == "openai":
+        openai_hosts = OPENAI_HOSTS
+    else:
+        openai_hosts = []
 
     hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
     if args.workers == 1:
         results: list[Result] = []
         set_host(hosts[0])
+        if openai_hosts:
+            set_openai_host(openai_hosts[0])
         for i, qname in enumerate(qnames, 1):
             print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]}", flush=True)
-            r = _process(qname, args.model, args.agent, args.verbose,
-                         args.skip_oracle, args.skip_existing,
-                         with_gemmi=args.with_gemmi, overwrite=args.overwrite)
+            r = _run_with_deadline(
+                _process,
+                (qname, args.model, args.agent, args.verbose,
+                 args.skip_oracle, args.skip_existing,
+                 args.with_gemmi, args.overwrite, args.commit),
+                FUNCTION_DEADLINE_SECONDS,
+                qname,
+            )
+            if r.error and "wall-clock deadline" in r.error:
+                print(f"  [{qname.rsplit('::', 1)[-1]}] {r.error}", flush=True)
             results.append(r)
     elif args.no_topo:
         results = _run_in_parallel(qnames, args)
@@ -478,6 +701,10 @@ def main_file() -> None:
     parser.add_argument("--filter",        metavar="STR",  help="Only process functions whose name contains STR")
     parser.add_argument("--mmdb-only",     action="store_true", help="Only process functions that use MMDB types (mmdb::*)")
     parser.add_argument("--model",         default=DEFAULT_MODEL)
+    parser.add_argument("--backend",       default="ollama", choices=["ollama", "openai"],
+                        help="LLM backend (default: ollama)")
+    parser.add_argument("--no-thinking",   action="store_true",
+                        help="Disable reasoning/thinking output (sets CT_THINK=0)")
     parser.add_argument("--agent",         action="store_true",  help="Agentic mode for oracle, test, and gemmi generation")
     parser.add_argument("--verbose",       action="store_true",  help="Print thinking and tool calls to console")
     parser.add_argument("--skip-oracle",   action="store_true",  help="Skip oracle generation if oracle.cc already exists")
@@ -488,6 +715,8 @@ def main_file() -> None:
                         help="Parallel workers (default 1)")
     parser.add_argument("--overwrite",     action="store_true",
                         help="Re-run all stages even if gemmi/function.hh + gemmi/test.cc already exist")
+    parser.add_argument("--commit",        action="store_true",
+                        help="Commit successful gemmi ports into the coot source tree")
     parser.add_argument("--list",          action="store_true",  help="List matching functions and exit")
     args = parser.parse_args()
 
@@ -523,18 +752,38 @@ def main_file() -> None:
         return
 
     with_gemmi = not args.no_gemmi
+    _install_batch_log(OUT_ROOT)
+    _start_heartbeat()
     print(f"Processing {len(qnames)} functions from {args.file} "
-          f"(model={args.model}, workers={args.workers}, agent={args.agent}, gemmi={with_gemmi})")
+          f"(model={args.model}, backend={args.backend}, workers={args.workers}, agent={args.agent}, gemmi={with_gemmi})")
+
+    os.environ["CT_BACKEND"] = args.backend
+    if args.no_thinking:
+        os.environ["CT_THINK"] = "0"
+
+    if args.backend == "openai":
+        openai_hosts = OPENAI_HOSTS
+    else:
+        openai_hosts = []
 
     hosts = getattr(args, "ollama_hosts", OLLAMA_HOSTS)
     if args.workers == 1:
         results: list[Result] = []
         set_host(hosts[0])
+        if openai_hosts:
+            set_openai_host(openai_hosts[0])
         for i, qname in enumerate(qnames, 1):
             print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]}", flush=True)
-            r = _process(qname, args.model, args.agent, args.verbose,
-                         args.skip_oracle, args.skip_existing,
-                         with_gemmi=with_gemmi, overwrite=args.overwrite)
+            r = _run_with_deadline(
+                _process,
+                (qname, args.model, args.agent, args.verbose,
+                 args.skip_oracle, args.skip_existing,
+                 with_gemmi, args.overwrite, False),
+                FUNCTION_DEADLINE_SECONDS,
+                qname,
+            )
+            if r.error and "wall-clock deadline" in r.error:
+                print(f"  [{qname.rsplit('::', 1)[-1]}] {r.error}", flush=True)
             results.append(r)
     elif args.no_topo:
         results = _run_in_parallel(qnames, args)

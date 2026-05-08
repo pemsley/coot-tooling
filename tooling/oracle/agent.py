@@ -17,8 +17,6 @@ import re
 import sqlite3
 import subprocess
 import textwrap
-import urllib.request
-import urllib.error
 from pathlib import Path
 
 from ..db import (
@@ -33,41 +31,9 @@ from ..db import (
     get_containing_class,
 )
 from .render import INCLUDE_ROOTS, _to_include, _load_override, MMDB_MANAGER_SNIPPET, caller_class_fields
-from ..ollama import chat_url
+from ..llm import chat as _chat
 
 OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"  # kept for backward-compat imports
-
-# Ollama runtime options. These override the model's Modelfile defaults for
-# this request only. The defaults below assume a long-running tool-calling
-# loop where 12+ turns of accumulated tool output are routine; the stock
-# 4096-token context silently rolls system + early user messages off the
-# front, which causes the model to "forget" its output-format rules and
-# ramble in plain prose. Override per environment via env vars if needed.
-OLLAMA_OPTIONS = {
-    "num_ctx":        int(os.environ.get("CT_OLLAMA_NUM_CTX",     32768)),
-    "num_predict":    int(os.environ.get("CT_OLLAMA_NUM_PREDICT", -1)),
-    "temperature":    float(os.environ.get("CT_OLLAMA_TEMP",      0.2)),
-    # top_p / top_k tighten the sampling distribution above and beyond
-    # temperature. 0.9 / 20 is a stricter pair than ollama's defaults
-    # (0.9 / 40), keeping the model on-track for structured code output.
-    "top_p":          float(os.environ.get("CT_OLLAMA_TOP_P",     0.9)),
-    "top_k":          int(os.environ.get("CT_OLLAMA_TOP_K",       20)),
-    # repeat_penalty trades off two failure modes:
-    #   * Too high (>=1.1): silently corrupts code where legitimate repetition
-    #     is structural — parallel EXPECT_EQ lines, identical #include blocks,
-    #     twin loops — by renaming a token in a copy "to be different".
-    #   * Too low (1.0): with low temperature + thinking mode, the model
-    #     locks onto its most recent paragraph and reproduces it verbatim
-    #     hundreds of times until num_ctx is exhausted. Real failure mode
-    #     observed in the wild — see add_neighbor_residues_for_refinement_help
-    #     where a single thinking block reproduced one phrase 116 times.
-    # 1.05 is the sweet spot: enough penalty to break paragraph-scale loops,
-    # too gentle to disrupt 10-token structural repetition. repeat_last_n=256
-    # (vs ollama's default 64) widens the window so paragraph-level repeats
-    # actually fall inside it.
-    "repeat_penalty": float(os.environ.get("CT_OLLAMA_REPEAT_PENALTY", 1.05)),
-    "repeat_last_n":  int(os.environ.get("CT_OLLAMA_REPEAT_LAST_N", 256)),
-}
 
 # Periodic format-reminder cadence. Transformer attention skews toward the
 # start and end of the context with a measurable dip in the middle ("lost in
@@ -91,13 +57,25 @@ THIRD_PARTY_INCLUDE = str(Path(__file__).parent.parent.parent / "third-party" / 
 # Paths the model is allowed to read.
 ALLOWED_READ_ROOTS = [PROJECT_ROOT] + INCLUDE_ROOTS + [str(TEST_DATA_DIR), THIRD_PARTY_INCLUDE]
 
-AGENT_SYSTEM_PROMPT = f"""\
+def make_agent_system_prompt(pdb_path: str, pdb_note: str = "") -> str:
+    """Build the agent system prompt with the given PDB path.
+
+    pdb_note is injected after the PDB line when the file choice was ambiguous —
+    it lists all available PDB files so the LLM can pick a more appropriate one.
+    """
+    pdb_line = f"       PDB: {pdb_path}"
+    if pdb_note:
+        pdb_line += (
+            "\n       (or choose a more appropriate file from the list below —\n"
+            f"        the selected path is only a default)\n{pdb_note}"
+        )
+    return f"""\
 You are writing a complete, compilable C++ program (oracle.cc) that observes
 the inputs and outputs of the function given by the user.
 
 Requirements for oracle.cc:
   1. Be self-contained — hardcode the test file paths below, do not use argc/argv.
-       PDB: {TEST_DATA_DIR}/example.pdb
+{pdb_line}
        MTZ: {TEST_DATA_DIR}/example.mtz
   2. Load the structure using the hardcoded path.
   3. Navigate the structure to reach a valid receiver/input for the function.
@@ -120,31 +98,10 @@ Proving the function actually ran (critical):
     test failure and fix the inputs or the print statements.
 
 Accessing private members (oracle.cc is a test binary — this is always allowed):
-  If the target function is private, or if setting up the receiver requires
-  touching private member variables, use the `#define private public` trick.
-
-  CRITICAL: the macro corrupts any header whose implementation uses `private`
-  internally (the entire C++ standard library does). The only reliable way to
-  prevent this is to fire ALL standard-library include guards BEFORE the macro
-  is activated. Use `#include <bits/stdc++.h>` (GCC extension, always
-  available on this platform) as the very first line of oracle.cc:
-
-    // oracle.cc — ALWAYS start with this line when using the trick
-    #include <bits/stdc++.h>   // fires all std include guards; safe from now on
-
-    // Then mmdb, clipper, and any other third-party headers
-    #include <mmdb2/mmdb_manager.h>
-    // ...
-
-    // Finally, wrap ONLY the specific Coot class header that declares the target
-    #define private public
-    #define protected public
-    #include "path/to/TargetClass.hh"
-    #undef protected
-    #undef private
-
-  With this ordering the macro is only active while the target class header is
-  parsed; every other header's include guard has already fired and is a no-op.
+  oracle.cc is compiled with `-fno-access-control`, which disables C++ access
+  checks entirely. You can call private and protected members and read/write
+  private member variables directly. Just write the call as if the member were
+  public — no source-level workaround is needed.
 
 Mandatory steps before outputting the final program:
   a. Call resolve_includes on your draft to verify all #include "..." headers.
@@ -156,6 +113,10 @@ Mandatory steps before outputting the final program:
 Use C++ code where possible, avoid C style code. Compile your draft as soon as reasonable.
 Don't keep trying to refine if the output is useful.\
 """
+
+
+# Backward-compat constant — used by code that imports AGENT_SYSTEM_PROMPT directly.
+AGENT_SYSTEM_PROMPT = make_agent_system_prompt(str(TEST_DATA_DIR / "example.pdb"))
 
 _MAX_COMPILE_ATTEMPTS = 20
 _EXTENSION_TURNS = 20
@@ -407,7 +368,7 @@ TOOLS: list[dict] = [
         "function": {
             "name": "inspect_pdb",
             "description": (
-                "Report what's actually in the test PDB (example.pdb): chain IDs, "
+                "Report what's actually in the selected test PDB: chain IDs, "
                 "residue ranges per chain, residue types, and a sample of atom names. "
                 "Use this to pick valid inputs (CIDs, chain IDs, residue numbers) "
                 "instead of guessing."
@@ -552,13 +513,21 @@ def _is_degenerate_thinking(
 ) -> tuple[bool, str]:
     """Detect pathological repetition in a thinking block.
 
-    Two checks:
+    Three checks:
+    0. Stream-abort marker: if the streaming guard in llm.py already aborted
+       this turn, treat as ground truth. The streaming guard catches
+       paraphrastic loops (variations of "Let me proceed... Actually...") that
+       fall through the line-frequency check below because no single literal
+       line repeats often enough.
     1. Single-line: a substantive line (≥min_line_len chars) appears
        ≥min_count times AND ≥min_ratio of all substantive lines.
     2. Block-level: a tuple of block_ngram_size consecutive substantive
        lines appears more than max_block_repeats times, catching the case
        where the model re-writes entire paragraphs rather than single lines.
     """
+    from ..llm import STREAM_ABORT_MARKER
+    if STREAM_ABORT_MARKER in thinking:
+        return True, "Streaming-time degeneracy guard fired during this turn."
     from collections import Counter
     # Strip fenced code blocks before analysis — repeated constant initialisers,
     # parallel EXPECT_EQ lines, and array literals inside ```...``` are legitimate
@@ -625,6 +594,12 @@ def _tool_read_file(path: str, offset: int = 0, limit: int = 300) -> str:
     real = Path(path).resolve()
     if not any(str(real).startswith(root) for root in ALLOWED_READ_ROOTS):
         return f"ERROR: path '{path}' is outside allowed roots. {ALLOWED_READ_ROOTS=} {real=}"
+    # Some models pass numeric args as strings (e.g. '0.0'). Coerce defensively.
+    try:
+        offset = int(float(offset))
+        limit = int(float(limit))
+    except (TypeError, ValueError):
+        return f"ERROR: offset/limit must be numeric, got offset={offset!r} limit={limit!r}"
     try:
         text = real.read_text(errors="replace")
     except OSError as e:
@@ -694,6 +669,12 @@ _GEMMI_TYPE_HINTS: dict[str, str] = {
         "Sequence number lives at .seqid.num.value (SeqId nests OptionalInt).\n"
         "  Insertion code at .seqid.icode (char). NO .num or .icode directly."
     ),
+    "molecules_container_t": (
+        "GLOBAL NAMESPACE — write `molecules_container_t mc;`, NOT\n"
+        "  `coot::molecules_container_t`. The class is declared in the global\n"
+        "  namespace in api/molecules-container.hh. Adding a `coot::` prefix\n"
+        "  fails with: \"no type named 'molecules_container_t' in namespace 'coot'\"."
+    ),
 }
 
 
@@ -749,9 +730,9 @@ def _tool_list_methods(conn: sqlite3.Connection, class_name: str) -> str:
         out.append(f"{marker:<11} {qn}")
     out.append("")
     out.append(
-        "Only [public] members are callable by default. To call [private] or "
-        "[protected] methods from oracle.cc, use the '#define private public' "
-        "technique described in the system prompt."
+        "All members ([public], [protected], [private]) are callable from "
+        "oracle.cc — it is compiled with -fno-access-control. Just call them "
+        "directly."
     )
     return "\n".join(out)
 
@@ -1103,14 +1084,15 @@ def _tool_grep_codebase(
     return "\n".join(matches)
 
 
-def _tool_inspect_pdb(chain: str | None = None) -> str:
-    """Parse example.pdb and summarise its contents.
+def _tool_inspect_pdb(chain: str | None = None, pdb_path: Path | None = None) -> str:
+    """Parse the selected example PDB and summarise its contents.
 
     Without 'chain': list chain IDs, residue count, and residue range per chain.
     With 'chain': list every (seq_num, ins_code, res_name) in that chain plus
     a sample of atom names.
     """
-    pdb_path = TEST_DATA_DIR / "example.pdb"
+    if pdb_path is None:
+        pdb_path = TEST_DATA_DIR / "example.pdb"
     if not pdb_path.exists():
         return f"ERROR: {pdb_path} not found."
 
@@ -1132,7 +1114,7 @@ def _tool_inspect_pdb(chain: str | None = None) -> str:
         records[chain_id].append((seq_num, ins_code, res_name, atom_name))
 
     if not records:
-        return "No ATOM/HETATM records found in example.pdb."
+        return f"No ATOM/HETATM records found in {pdb_path.name}."
 
     if chain:
         rows = records.get(chain)
@@ -1156,7 +1138,7 @@ def _tool_inspect_pdb(chain: str | None = None) -> str:
                 break
         return "\n".join(lines)
 
-    lines = [f"example.pdb — {len(records)} chain(s):"]
+    lines = [f"{pdb_path.name} — {len(records)} chain(s):"]
     for cid in sorted(records):
         rows = records[cid]
         seqs = sorted({(s, i) for s, i, _, _ in rows})
@@ -1291,10 +1273,19 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
         oracle_bin = oracle_out / "oracle"
         oracle_cc.write_text(code)
         write_compile_script(oracle_out)
-        proc = subprocess.run(
-            ["sh", str(oracle_out / "compile.sh")],
-            capture_output=True, text=True, cwd=str(oracle_out),
-        )
+        try:
+            proc = subprocess.run(
+                ["sh", str(oracle_out / "compile.sh")],
+                capture_output=True, text=True, cwd=str(oracle_out),
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            last_binary[0] = None
+            return (
+                f"Compilation FAILED (attempt {attempts[0]}/{_MAX_COMPILE_ATTEMPTS}): "
+                "timed out after 180s — likely a runaway template instantiation. "
+                "Simplify includes or types and try again."
+            )
         output = (proc.stdout + proc.stderr).strip()
         lines = output.splitlines()
         if len(lines) > 100:
@@ -1303,15 +1294,36 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
             last_binary[0] = oracle_bin
             return f"Compilation succeeded (attempt {attempts[0]}/{_MAX_COMPILE_ATTEMPTS})."
         last_binary[0] = None
-        return f"Compilation FAILED (attempt {attempts[0]}/{_MAX_COMPILE_ATTEMPTS}):\n{output}"
+        msg = f"Compilation FAILED (attempt {attempts[0]}/{_MAX_COMPILE_ATTEMPTS}):\n{output}"
+        if (
+            "no type named 'molecules_container_t' in namespace 'coot'" in output
+            or "coot::molecules_container_t" in output
+        ):
+            msg += (
+                "\n\nFIX: `molecules_container_t` is in the GLOBAL namespace, "
+                "not `coot::`. Replace every `coot::molecules_container_t` with "
+                "`molecules_container_t` and recompile."
+            )
+        return msg
 
     def run_handler() -> str:
         if last_binary[0] is None:
             return "No compiled binary available — call compile_oracle first."
-        proc = subprocess.run(
-            [str(last_binary[0].absolute())],
-            capture_output=True, text=True, cwd=str(oracle_out),
-        )
+        try:
+            proc = subprocess.run(
+                [str(last_binary[0].absolute())],
+                capture_output=True, text=True, cwd=str(oracle_out),
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired as exc:
+            partial = (exc.stdout or "") + (exc.stderr or "")
+            if isinstance(partial, bytes):
+                partial = partial.decode(errors="replace")
+            return (
+                "FAILED (timed out after 300s — the binary did not exit). "
+                "Likely an infinite loop or a blocking call. Partial output:\n"
+                + partial[-2000:]
+            )
         output = (proc.stdout + proc.stderr).strip()
         lines = output.splitlines()
         if len(lines) > 100:
@@ -1336,7 +1348,12 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
     return compile_handler, run_handler, compiled_ok
 
 
-def _dispatch(conn: sqlite3.Connection, name: str, args: dict) -> str:
+def _dispatch(
+    conn: sqlite3.Connection,
+    name: str,
+    args: dict,
+    pdb_path: Path | None = None,
+) -> str:
     if name == "read_file":
         return _tool_read_file(args["path"], args.get("offset", 0), args.get("limit", 300))
     if name == "lookup_function":
@@ -1356,7 +1373,7 @@ def _dispatch(conn: sqlite3.Connection, name: str, args: dict) -> str:
     if name == "grep_codebase":
         return _tool_grep_codebase(args["pattern"], args.get("glob"))
     if name == "inspect_pdb":
-        return _tool_inspect_pdb(args.get("chain"))
+        return _tool_inspect_pdb(args.get("chain"), pdb_path=pdb_path)
     if name == "get_base_classes":
         return _tool_get_base_classes(conn, args["name"])
     if name == "find_symbol":
@@ -1368,60 +1385,6 @@ def _dispatch(conn: sqlite3.Connection, name: str, args: dict) -> str:
 
 # ── Ollama chat API ───────────────────────────────────────────────────────────
 
-_DEGEN_CHECK_INTERVAL = 2000  # chars of new thinking between degeneracy checks
-
-def _chat(messages: list[dict], model: str, tools: list[dict]) -> dict:
-    payload = json.dumps({
-        "model":    model,
-        "messages": messages,
-        "tools":    tools,
-        "stream":   True,
-        "think":    True,
-        "options":  OLLAMA_OPTIONS,
-    }).encode()
-    req = urllib.request.Request(
-        chat_url(),
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    accumulated_thinking = ""
-    accumulated_content  = ""
-    accumulated_tool_calls: list = []
-    last_check_len        = 0
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        for raw_line in resp:
-            line = raw_line.strip()
-            if not line:
-                continue
-            chunk = json.loads(line)
-            msg_chunk = chunk.get("message", {})
-            accumulated_thinking += msg_chunk.get("thinking", "") or ""
-            accumulated_content  += msg_chunk.get("content",  "") or ""
-            # Tool calls arrive in a single intermediate chunk, not in the
-            # done:true stats chunk — accumulate from every chunk.
-            if msg_chunk.get("tool_calls"):
-                accumulated_tool_calls = msg_chunk["tool_calls"]
-            if chunk.get("done"):
-                break
-            # Abort early if thinking enters a degenerate loop, saving the
-            # rest of num_ctx from being consumed by garbage. The caller's
-            # post-hoc _is_degenerate_thinking check will still fire on the
-            # partial thinking and trigger the rescue path.
-            new_len = len(accumulated_thinking)
-            if new_len - last_check_len >= _DEGEN_CHECK_INTERVAL:
-                last_check_len = new_len
-                if _is_degenerate_thinking(accumulated_thinking)[0]:
-                    break
-    return {
-        "message": {
-            "role":       "assistant",
-            "thinking":   accumulated_thinking,
-            "content":    accumulated_content,
-            "tool_calls": accumulated_tool_calls,
-        }
-    }
-
-
 # ── agent loop ────────────────────────────────────────────────────────────────
 
 def generate_with_agent(
@@ -1430,12 +1393,18 @@ def generate_with_agent(
     model: str,
     oracle_out: Path | None = None,
     verbose: bool = False,
+    pdb_file: str = "example.pdb",
+    pdb_note: str = "",
 ) -> tuple[str | None, str]:
     """Run the agentic oracle generation loop.
 
     Returns (oracle_code, trace_text).
     oracle_code is None if the function wasn't found or the model produced nothing.
     trace_text is a human-readable log of every tool call and result.
+
+    pdb_file: filename (relative to test-data/) of the example PDB to use.
+    pdb_note: injected into the prompt when the choice was ambiguous, listing
+              all available PDB files so the LLM can choose.
     """
     fn = get_function(conn, function_qname)
     if not fn:
@@ -1450,25 +1419,11 @@ def generate_with_agent(
     # If the target function itself is private/protected, emit an upfront
     # directive so the agent doesn't waste turns discovering it can't call it.
     if target_is_private:
-        header_file = fn["file"]
         parts.append(
-            f"## WARNING: `{function_qname}` is `{fn['access']}`\n\n"
-            f"You cannot call this function from external code without the "
-            f"`#define private public` technique. Use this exact pattern — "
-            f"`<bits/stdc++.h>` MUST be the first line so all standard-library "
-            f"include guards fire before the macro is active:\n\n"
-            f"```cpp\n"
-            f"#include <bits/stdc++.h>  // fires all std include guards first\n"
-            f"#include <mmdb2/mmdb_manager.h>\n"
-            f"// ... other mmdb/clipper/coot includes (NOT the target class header) ...\n\n"
-            f"#define private public\n"
-            f"#define protected public\n"
-            f'#include "{header_file}"\n'
-            f"#undef protected\n"
-            f"#undef private\n"
-            f"```\n\n"
-            f"With this in place you can call `{function_qname}` and assign "
-            f"any private member variables needed for setup."
+            f"## Note: `{function_qname}` is `{fn['access']}`\n\n"
+            f"oracle.cc is compiled with `-fno-access-control`, so you can call "
+            f"this {fn['access']} member and read/write any {fn['access']} member "
+            f"variables directly. Just call the function as if it were public."
         )
 
     parts.append(f"## Function to observe: `{function_qname}`")
@@ -1489,8 +1444,9 @@ def generate_with_agent(
     if callers:
         parts.append("## Example callers")
         parts.append(
-            "_Reference only. In-class callers can access private members directly; "
-            "oracle.cc must use `#define private public` to do the same (see system prompt)._"
+            "_Reference only. oracle.cc is compiled with `-fno-access-control`, "
+            "so it can access any private/protected members the same way these "
+            "in-class callers do._"
         )
         for i, c in enumerate(callers, 1):
             rel = c["file"].replace(PROJECT_ROOT + "/", "")
@@ -1498,7 +1454,7 @@ def generate_with_agent(
             caller_cls_qname = caller_cls["qualified_name"] if caller_cls else None
             in_class = target_class is not None and caller_cls_qname == target_class
             access_note = (
-                "in-class member — accesses private state directly (use `#define private public` to replicate)"
+                "in-class member — accesses private state directly (oracle.cc can do the same via -fno-access-control)"
                 if in_class else
                 "external caller"
             )
@@ -1523,23 +1479,25 @@ def generate_with_agent(
         parts.append(f"```\n{notes_context.rstrip()}\n```")
 
     # Attach the curated construction snippet for the containing class if one exists.
+    selected_pdb_path = TEST_DATA_DIR / pdb_file
     if target_class:
-        override = _load_override(target_class)
+        override = _load_override(target_class, pdb_path=str(selected_pdb_path))
         if override:
             parts.append(f"## How to construct `{target_class}`")
             parts.append(f"```cpp\n{override.rstrip()}\n```")
 
     user_content = "\n\n".join(parts)
 
+    system_prompt = make_agent_system_prompt(str(selected_pdb_path), pdb_note)
     messages: list[dict] = [
-        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user",   "content": user_content},
     ]
 
     if oracle_out is not None:
         oracle_out.mkdir(parents=True, exist_ok=True)
         (oracle_out / "prompt.txt").write_text(
-            f"=== SYSTEM ===\n{AGENT_SYSTEM_PROMPT}\n\n"
+            f"=== SYSTEM ===\n{system_prompt}\n\n"
             f"=== USER ===\n{user_content}\n"
         )
 
@@ -1563,7 +1521,7 @@ def generate_with_agent(
             return run_handler()
         if name in ("compile_oracle", "run_oracle"):
             return "Tool unavailable — no output directory configured."
-        return _dispatch(conn, name, args)
+        return _dispatch(conn, name, args, pdb_path=selected_pdb_path)
 
     tools = ORACLE_TOOLS if oracle_out else TOOLS
     oracle_code: str | None = None
@@ -1647,7 +1605,15 @@ def generate_with_agent(
         _save_draft(code)
         return code
 
+    def _progress(label: str, tool_calls: list) -> None:
+        if tool_calls:
+            names = ", ".join(tc.get("function", {}).get("name", "?") for tc in tool_calls)
+            print(f"\r  [oracle] {label} → {names}", flush=True)
+        else:
+            print(f"\r  [oracle] {label} → done (final answer)", flush=True)
+
     for turn in range(20):
+        print(f"  [oracle] turn {turn + 1}/20 ...", end="", flush=True)
         data = _chat(messages, model, tools)
         msg  = data.get("message", {})
         tool_calls        = msg.get("tool_calls") or []
@@ -1670,8 +1636,10 @@ def generate_with_agent(
         if degen:
             degen_recoveries[0] += 1
             if degen_recoveries[0] > 2:
+                print(f"\r  [oracle] turn {turn + 1}/20 → DEGENERATE — rescue", flush=True)
                 trace_lines.append(f"[agent] {diag} — recovery exhausted, going to rescue.\n")
                 break
+            print(f"\r  [oracle] turn {turn + 1}/20 → DEGENERATE — nudging ({degen_recoveries[0]})", flush=True)
             trace_lines.append(
                 f"[agent] {diag} — injecting recovery nudge "
                 f"(attempt {degen_recoveries[0]}).\n"
@@ -1688,6 +1656,8 @@ def generate_with_agent(
             messages.append({"role": "user", "content": recovery_msg})
             trace_lines.append(f"[recovery nudge]\n{textwrap.indent(recovery_msg, '  ')}\n")
             continue
+
+        _progress(f"turn {turn + 1}/20", tool_calls)
 
         if not tool_calls:
             trace_lines.append(f"[assistant — final]\n{textwrap.indent(assistant_content, '  ')}\n")
@@ -1717,6 +1687,7 @@ def generate_with_agent(
         messages.append({"role": "user",
                          "content": _EXTENSION_PROMPT.format(n=_EXTENSION_TURNS)})
 
+        print(f"  [oracle] extension check ...", end="", flush=True)
         data = _chat(messages, model, tools)
         msg  = data.get("message", {})
         tool_calls        = msg.get("tool_calls") or []
@@ -1729,13 +1700,16 @@ def generate_with_agent(
             trace_lines.append(f"[thinking — extension]\n{textwrap.indent(thinking, '  ')}\n")
 
         if not tool_calls:
+            print(f"\r  [oracle] extension check → declined", flush=True)
             trace_lines.append(f"[assistant — final (declined extension)]\n{textwrap.indent(assistant_content, '  ')}\n")
             oracle_code = _extract_code(assistant_content)
         else:
+            print(f"\r  [oracle] extension check → granted", flush=True)
             trace_lines.append(f"[agent] Extension granted ({_EXTENSION_TURNS} more turns).\n")
             messages.extend(_run_tool_calls(tool_calls))
 
             for ext_turn in range(_EXTENSION_TURNS):
+                print(f"  [oracle] ext turn {ext_turn + 1}/{_EXTENSION_TURNS} ...", end="", flush=True)
                 data = _chat(messages, model, tools)
                 msg  = data.get("message", {})
                 tool_calls        = msg.get("tool_calls") or []
@@ -1746,6 +1720,8 @@ def generate_with_agent(
 
                 if thinking:
                     trace_lines.append(f"[thinking — ext turn {ext_turn + 1}]\n{textwrap.indent(thinking, '  ')}\n")
+
+                _progress(f"ext turn {ext_turn + 1}/{_EXTENSION_TURNS}", tool_calls)
 
                 if not tool_calls:
                     trace_lines.append(f"[assistant — final]\n{textwrap.indent(assistant_content, '  ')}\n")

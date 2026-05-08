@@ -53,7 +53,14 @@ def _extract_cpp(text: str) -> str:
 
 def _run_oracle(oracle_subdir: Path) -> OracleResult:
     binary = oracle_subdir / "oracle"
-    proc = subprocess.run([str(binary)], capture_output=True, text=True)
+    try:
+        proc = subprocess.run([str(binary)], capture_output=True, text=True,
+                              timeout=60)
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return parse_output(-1, stdout,
+                            stderr + "\n[_run_oracle] timed out after 60s")
     return parse_output(proc.returncode, proc.stdout, proc.stderr)
 
 

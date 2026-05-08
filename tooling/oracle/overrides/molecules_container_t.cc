@@ -3,5 +3,5 @@
 molecules_container_t mc;
 mc.geometry_init_standard();
 
-int imol     = mc.read_pdb("@TEST_DATA_DIR@/example.pdb");
+int imol     = mc.read_pdb("@PDB_PATH@");
 int imol_map = mc.read_mtz("@TEST_DATA_DIR@/example.mtz", "FWT", "PHWT", "W", false, false);
