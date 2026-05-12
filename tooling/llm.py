@@ -233,6 +233,8 @@ class OllamaBackend:
         accumulated_content = ""
         accumulated_tool_calls: list = []
         last_check_len = 0
+        prompt_tokens = None
+        output_tokens = None
         start_time = time.monotonic()
 
         resp = urllib.request.urlopen(req, timeout=600)
@@ -256,6 +258,8 @@ class OllamaBackend:
                 if msg_chunk.get("tool_calls"):
                     accumulated_tool_calls = msg_chunk["tool_calls"]
                 if chunk.get("done"):
+                    prompt_tokens = chunk.get("prompt_eval_count")
+                    output_tokens = chunk.get("eval_count")
                     break
                 # Streaming degeneracy guard — periodic-check the thinking tail.
                 # Only thinking is checked: code/content blocks legitimately
@@ -288,7 +292,13 @@ class OllamaBackend:
                 "thinking": accumulated_thinking,
                 "content": accumulated_content,
                 "tool_calls": accumulated_tool_calls,
-            }
+            },
+            "_meta": {
+                "elapsed_s": time.monotonic() - start_time,
+                "prompt_tokens": prompt_tokens,
+                "output_tokens": output_tokens,
+                "backend": "ollama",
+            },
         }
 
 
@@ -338,6 +348,7 @@ class OpenAIBackend:
             "model": model,
             "messages": messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
             "temperature": SAMPLING_PARAMS["temperature"],
             "top_p": SAMPLING_PARAMS["top_p"],
         }
@@ -359,6 +370,8 @@ class OpenAIBackend:
         accumulated_content = ""
         accumulated_thinking = ""
         tool_calls_map: dict[int, dict] = {}
+        prompt_tokens = None
+        output_tokens = None
         start_time = time.monotonic()
 
         try:
@@ -374,6 +387,10 @@ class OpenAIBackend:
                         raise _LLMTimeout(
                             f"OpenAI call exceeded {LLM_CALL_TIMEOUT}s ({elapsed:.0f}s elapsed)"
                         )
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    prompt_tokens = getattr(usage, "prompt_tokens", prompt_tokens)
+                    output_tokens = getattr(usage, "completion_tokens", output_tokens)
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -400,7 +417,7 @@ class OpenAIBackend:
                     for tc in tcs:
                         idx = tc.index if tc.index is not None else 0
                         slot = tool_calls_map.setdefault(
-                            idx, {"function": {"name": "", "arguments": ""}}
+                            idx, {"type": "function", "function": {"name": "", "arguments": ""}}
                         )
                         if getattr(tc, "id", None):
                             slot["id"] = tc.id
@@ -442,7 +459,13 @@ class OpenAIBackend:
                 "thinking": accumulated_thinking,
                 "content": accumulated_content,
                 "tool_calls": final_tool_calls,
-            }
+            },
+            "_meta": {
+                "elapsed_s": time.monotonic() - start_time,
+                "prompt_tokens": prompt_tokens,
+                "output_tokens": output_tokens,
+                "backend": "openai",
+            },
         }
 
 

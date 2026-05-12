@@ -160,12 +160,19 @@ def _run_with_deadline(target, args_tuple, deadline_s: int, qname: str) -> "Resu
         return r
     return box["result"]
 
-from .db import connect, get_class_functions, get_file_functions, get_internal_call_deps
+from .db import (
+    connect,
+    expand_with_callee_deps,
+    get_class_functions,
+    get_file_functions,
+    get_internal_call_deps,
+)
 from .oracle.generate import DEFAULT_MODEL, OUT_ROOT, generate_one, sanitize_name
 from .test.generate import generate_test
 from .gemmi.generate import generate_gemmi
 from .gemmi.aggregate import aggregate_gemmi_files
 from .gemmi.compile import run_gemmi_test_binary
+from .test.compile import run_test_binary
 from .ollama import OLLAMA_HOSTS, set_host, get_host
 from .llm import OPENAI_HOSTS, set_openai_host
 
@@ -188,18 +195,112 @@ class Result:
 
 # ── dependency ordering ───────────────────────────────────────────────────────
 
+def _ready_scc_nodes(remaining: dict[str, set[str]]) -> list[str]:
+    """When the deps graph has no zero-dep node, every remaining node is
+    part of (or feeds into) a cycle. Return the nodes of the SCC(s) whose
+    deps point ONLY within their own SCC — these are the cycles that have
+    nothing left to wait for, so they're the safe ones to break next.
+
+    Picking outside this set risks promoting a node whose dep is in a
+    different cycle that hasn't been resolved yet, which violates the
+    bottom-up invariant.
+
+    Tarjan SCC, iterative to avoid recursion limits on large batches.
+    """
+    indices: dict[str, int] = {}
+    lowlink: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    node_to_scc: dict[str, int] = {}
+    sccs: list[list[str]] = []
+    next_index = 0
+
+    for root in list(remaining):
+        if root in indices:
+            continue
+        # Iterative Tarjan: each frame holds (node, iterator over its deps).
+        work: list[tuple[str, "iter"]] = []
+        indices[root] = next_index
+        lowlink[root] = next_index
+        next_index += 1
+        stack.append(root)
+        on_stack.add(root)
+        work.append((root, iter(remaining.get(root, ()))))
+
+        while work:
+            v, it = work[-1]
+            advanced = False
+            for w in it:
+                if w not in remaining:
+                    continue
+                if w not in indices:
+                    indices[w] = next_index
+                    lowlink[w] = next_index
+                    next_index += 1
+                    stack.append(w)
+                    on_stack.add(w)
+                    work.append((w, iter(remaining.get(w, ()))))
+                    advanced = True
+                    break
+                elif w in on_stack:
+                    lowlink[v] = min(lowlink[v], indices[w])
+            if advanced:
+                continue
+            # All of v's children processed — pop frame.
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                lowlink[parent] = min(lowlink[parent], lowlink[v])
+            if lowlink[v] == indices[v]:
+                comp: list[str] = []
+                while True:
+                    w = stack.pop()
+                    on_stack.discard(w)
+                    comp.append(w)
+                    if w == v:
+                        break
+                scc_id = len(sccs)
+                sccs.append(comp)
+                for n in comp:
+                    node_to_scc[n] = scc_id
+
+    ready: list[str] = []
+    for scc_id, comp in enumerate(sccs):
+        internal_only = True
+        for v in comp:
+            for w in remaining.get(v, ()):
+                if w in node_to_scc and node_to_scc[w] != scc_id:
+                    internal_only = False
+                    break
+            if not internal_only:
+                break
+        if internal_only:
+            ready.extend(comp)
+    return sorted(ready)
+
+
+def _cycle_break_pick(remaining: dict[str, set[str]]) -> str:
+    """Choose a node to promote when no node has zero deps. Prefer nodes in
+    SCCs whose deps are entirely internal; fall back to fewest-deps + qname
+    if SCC analysis somehow returns nothing (shouldn't happen)."""
+    candidates = _ready_scc_nodes(remaining)
+    if candidates:
+        return candidates[0]
+    return min(remaining, key=lambda q: (len(remaining[q]), q))
+
+
 def topo_order(deps: dict[str, set[str]]) -> list[str]:
     """Return qnames in bottom-up call order: callees (inside the batch)
-    come before their callers. On cycles, break by picking the node with
-    the fewest outstanding in-batch deps (deterministic tie-break: qname).
+    come before their callers. On cycles, break by promoting a node from
+    an SCC whose deps are entirely internal, so we never place a caller
+    before a callee that lives in a different unresolved cycle.
     """
     remaining = {q: set(d) for q, d in deps.items()}
     order: list[str] = []
     while remaining:
         ready = sorted(q for q, d in remaining.items() if not d)
         if not ready:
-            pick = min(remaining, key=lambda q: (len(remaining[q]), q))
-            ready = [pick]
+            ready = [_cycle_break_pick(remaining)]
         for q in ready:
             order.append(q)
             del remaining[q]
@@ -214,18 +315,15 @@ def topo_waves(deps: dict[str, set[str]]) -> list[list[str]]:
     Each wave contains qnames that depend ONLY on names in earlier waves —
     so they can be processed concurrently. Use this with ThreadPoolExecutor
     to keep the callees-first guarantee while still parallelising across
-    workers. Cycle-breaking matches `topo_order`: when no deps are clear,
-    promote the node with the fewest outstanding deps (deterministic).
+    workers. Cycle-breaking matches `topo_order`: promote from an SCC whose
+    deps are entirely internal.
     """
     remaining = {q: set(d) for q, d in deps.items()}
     waves: list[list[str]] = []
     while remaining:
         ready = sorted(q for q, d in remaining.items() if not d)
         if not ready:
-            # Cycle: break it by promoting the node closest to ready, which
-            # avoids stalling on a strongly-connected component.
-            pick = min(remaining, key=lambda q: (len(remaining[q]), q))
-            ready = [pick]
+            ready = [_cycle_break_pick(remaining)]
         waves.append(ready)
         for q in ready:
             del remaining[q]
@@ -242,13 +340,23 @@ def _gemmi_is_passing(out_dir: Path) -> bool:
     Checks run.log first (fast path). Falls back to executing the binary when
     run.log is absent (e.g. functions processed before run.log was introduced).
     """
-    run_log = out_dir / "gemmi" / "run.log"
-    if run_log.exists():
-        return "[  PASSED  ]" in run_log.read_text()
-    test_bin = out_dir / "gemmi" / "test_check"
+    gemmi_dir = out_dir / "gemmi"
+    run_exit = gemmi_dir / "run.exit"
+    if run_exit.exists():
+        return run_exit.read_text().strip() == "0"
+    # Legacy runs have no run.exit. The substring check below was unreliable
+    # (stdout buffering could drop the "[ PASSED ]" tail), so if the log
+    # looks "failing" but a binary exists, re-run it once to recover before
+    # marking the function as failed.
+    run_log = gemmi_dir / "run.log"
+    log_text = run_log.read_text() if run_log.exists() else ""
+    if "[  PASSED  ]" in log_text:
+        return True
+    test_bin = gemmi_dir / "test_check"
     if not test_bin.exists():
         return False
-    ok, _ = run_gemmi_test_binary(test_bin)
+    ok, output = run_gemmi_test_binary(test_bin)
+    run_log.write_text(output)
     return ok
 
 
@@ -262,9 +370,30 @@ def _is_complete(out_dir: Path) -> bool:
 
 
 def _test_is_passing(out_dir: Path) -> bool:
-    """Return True if test/run.log exists and records an all-passed result."""
-    log = out_dir / "test" / "run.log"
-    return log.exists() and "[  PASSED  ]" in log.read_text()
+    """Return True if the test run recorded a successful exit.
+
+    Prefers the explicit `run.exit` sidecar (return code from
+    `run_test_binary`) over grepping run.log for "[ PASSED ]", which is
+    fragile when stdout is fully buffered and the gtest summary lines
+    get dropped on exit.
+    """
+    test_dir = out_dir / "test"
+    run_exit = test_dir / "run.exit"
+    if run_exit.exists():
+        return run_exit.read_text().strip() == "0"
+    # Legacy runs have no run.exit and may have a truncated run.log that
+    # is missing "[ PASSED ]" even though the test actually passed. Re-run
+    # the binary once (under stdbuf) to recover the true result.
+    log = test_dir / "run.log"
+    log_text = log.read_text() if log.exists() else ""
+    if "[  PASSED  ]" in log_text:
+        return True
+    test_bin = test_dir / "test"
+    if not test_bin.exists():
+        return False
+    ok, output = run_test_binary(test_bin)
+    log.write_text(output)
+    return ok
 
 
 def _process(
@@ -537,6 +666,45 @@ def _run_topo_waves(qnames: list[str], args) -> list[Result]:
     return results
 
 
+def _print_dry_run(qnames: list[str], seeds: set[str], workers: int) -> None:
+    """Print the resolved batch: order, in-batch call deps, and which
+    entries are seeds vs. dep-expansions. Mirrors how the scheduler will
+    actually process them."""
+    conn = connect()
+    try:
+        deps = get_internal_call_deps(conn, qnames)
+    finally:
+        conn.close()
+
+    if workers == 1:
+        order = topo_order(deps)
+        print(f"\nProcessing order ({len(order)} method(s), bottom-up; "
+              f"★ = seed, · = pulled in by --with-deps):")
+        for i, q in enumerate(order, 1):
+            marker = "★" if q in seeds else "·"
+            callees = sorted(deps.get(q, set()))
+            if callees:
+                short_callees = ", ".join(c.rsplit("::", 1)[-1] for c in callees)
+                print(f"  {i:>3}. {marker} {q}")
+                print(f"       └─ calls (in-batch): {short_callees}")
+            else:
+                print(f"  {i:>3}. {marker} {q}")
+    else:
+        waves = topo_waves(deps)
+        print(f"\nParallel wave schedule ({len(qnames)} method(s) in "
+              f"{len(waves)} wave(s), {workers} worker(s); ★ = seed):")
+        for w_idx, wave in enumerate(waves, 1):
+            print(f"  wave {w_idx} ({len(wave)} method(s)):")
+            for q in wave:
+                marker = "★" if q in seeds else "·"
+                callees = sorted(deps.get(q, set()))
+                if callees:
+                    short_callees = ", ".join(c.rsplit("::", 1)[-1] for c in callees)
+                    print(f"    {marker} {q}  ← {short_callees}")
+                else:
+                    print(f"    {marker} {q}")
+
+
 # ── summary ───────────────────────────────────────────────────────────────────
 
 def _print_summary(results: list[Result]) -> None:
@@ -598,6 +766,10 @@ def main() -> None:
                         help="Disable bottom-up call-graph ordering (default is enabled: "
                              "functions with no in-batch callees go first, so any callees "
                              "are already converted by the time their callers are processed)")
+    parser.add_argument("--with-deps",     action="store_true",
+                        help="Also include transitive callees of the selected methods so "
+                             "they're converted callees-first. Combined with --mmdb-only, "
+                             "only callees that themselves use mmdb types are pulled in.")
     parser.add_argument("--workers",       type=int, default=1, metavar="N",
                         help="Parallel workers (default 1)")
     parser.add_argument("--overwrite",     action="store_true",
@@ -605,6 +777,8 @@ def main() -> None:
     parser.add_argument("--commit",        action="store_true",
                         help="Commit successful gemmi ports into the coot source tree")
     parser.add_argument("--list",          action="store_true", help="List matching methods and exit")
+    parser.add_argument("--dry-run",       action="store_true",
+                        help="Print the resolved processing order and in-batch call graph, then exit")
     args = parser.parse_args()
 
     conn = connect()
@@ -621,6 +795,16 @@ def main() -> None:
             print(f"No methods match filter '{args.filter}'", file=sys.stderr)
             sys.exit(1)
 
+    seeds = set(qnames)
+    if args.with_deps:
+        conn = connect()
+        try:
+            qnames = expand_with_callee_deps(conn, qnames, mmdb_only=args.mmdb_only)
+        finally:
+            conn.close()
+        print(f"--with-deps: {len(seeds)} seed(s) expanded to {len(qnames)} method(s) "
+              f"(adding transitive callees)")
+
     # Bottom-up topological ordering: callees before callers.
     # Single-worker mode → flat order. Multi-worker mode → waves so parallelism
     # is preserved without violating the callees-first invariant.
@@ -631,6 +815,10 @@ def main() -> None:
         finally:
             conn.close()
         qnames = topo_order(deps)
+
+    if args.dry_run:
+        _print_dry_run(qnames, seeds, args.workers)
+        return
 
     if args.list:
         for q in qnames:
@@ -711,6 +899,10 @@ def main_file() -> None:
     parser.add_argument("--skip-existing", action="store_true",  help="Skip functions that already have oracle.cc")
     parser.add_argument("--no-gemmi",      action="store_true",  help="Skip gemmi port stage (default: gemmi is run)")
     parser.add_argument("--no-topo",       action="store_true",  help="Disable bottom-up call-graph ordering")
+    parser.add_argument("--with-deps",     action="store_true",
+                        help="Also include transitive callees of the selected functions so "
+                             "they're converted callees-first. Combined with --mmdb-only, "
+                             "only callees that themselves use mmdb types are pulled in.")
     parser.add_argument("--workers",       type=int, default=1, metavar="N",
                         help="Parallel workers (default 1)")
     parser.add_argument("--overwrite",     action="store_true",
@@ -718,6 +910,8 @@ def main_file() -> None:
     parser.add_argument("--commit",        action="store_true",
                         help="Commit successful gemmi ports into the coot source tree")
     parser.add_argument("--list",          action="store_true",  help="List matching functions and exit")
+    parser.add_argument("--dry-run",       action="store_true",
+                        help="Print the resolved processing order and in-batch call graph, then exit")
     args = parser.parse_args()
 
     conn = connect()
@@ -734,6 +928,16 @@ def main_file() -> None:
             print(f"No functions match filter '{args.filter}'", file=sys.stderr)
             sys.exit(1)
 
+    seeds = set(qnames)
+    if args.with_deps:
+        conn = connect()
+        try:
+            qnames = expand_with_callee_deps(conn, qnames, mmdb_only=args.mmdb_only)
+        finally:
+            conn.close()
+        print(f"--with-deps: {len(seeds)} seed(s) expanded to {len(qnames)} function(s) "
+              f"(adding transitive callees)")
+
     # Bottom-up topological ordering: callees before callers.
     # Single-worker mode → flat order. Multi-worker mode → waves so parallelism
     # is preserved without violating the callees-first invariant.
@@ -744,6 +948,10 @@ def main_file() -> None:
         finally:
             conn.close()
         qnames = topo_order(deps)
+
+    if args.dry_run:
+        _print_dry_run(qnames, seeds, args.workers)
+        return
 
     if args.list:
         for q in qnames:

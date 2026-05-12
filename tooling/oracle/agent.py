@@ -11,6 +11,7 @@ oracle so you can audit what the model looked up.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -33,6 +34,30 @@ from ..db import (
 from .render import INCLUDE_ROOTS, _to_include, _load_override, MMDB_MANAGER_SNIPPET, caller_class_fields
 from ..llm import chat as _chat
 
+
+def _log_llm_timing(data: dict, *, stage: str, turn, verbose: bool, trace_lines: list) -> None:
+    """Emit one LLM-call timing line to the trace (and stdout if verbose).
+
+    `turn` may be an int or any str label (e.g. "rescue"). Silent unless the
+    backend attached `_meta` to the response — older callers that bypass the
+    backend wrapper are no-ops.
+    """
+    meta = data.get("_meta") if isinstance(data, dict) else None
+    if not meta:
+        return
+    elapsed = meta.get("elapsed_s") or 0.0
+    pt = meta.get("prompt_tokens")
+    ot = meta.get("output_tokens")
+    tps = f"{ot / elapsed:.0f}tok/s" if (ot and elapsed > 0) else "?tok/s"
+    line = (
+        f"[llm — {stage} turn {turn}] elapsed={elapsed:.1f}s "
+        f"prompt={pt if pt is not None else '?'} output={ot if ot is not None else '?'} {tps}"
+    )
+    trace_lines.append(line + "\n")
+    if verbose:
+        print(f"  {line}", flush=True)
+
+
 OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"  # kept for backward-compat imports
 
 # Periodic format-reminder cadence. Transformer attention skews toward the
@@ -52,10 +77,11 @@ NO_COMPILE_AFTER = int(os.environ.get("CT_AGENT_NO_COMPILE_AFTER", 10))
 NOTES_DIR        = Path(__file__).parent / "notes"
 ANSWER_MARKER    = "## Answer"
 TEST_DATA_DIR    = Path(__file__).parent.parent.parent / "test-data"
+GENERATED_TEST_DIR    = Path(__file__).parent.parent.parent / "generated-tests"
 THIRD_PARTY_INCLUDE = str(Path(__file__).parent.parent.parent / "third-party" / "google-test" / "include")
 
 # Paths the model is allowed to read.
-ALLOWED_READ_ROOTS = [PROJECT_ROOT] + INCLUDE_ROOTS + [str(TEST_DATA_DIR), THIRD_PARTY_INCLUDE]
+ALLOWED_READ_ROOTS = [PROJECT_ROOT] + INCLUDE_ROOTS + [str(TEST_DATA_DIR), THIRD_PARTY_INCLUDE, str(GENERATED_TEST_DIR)]
 
 def make_agent_system_prompt(pdb_path: str, pdb_note: str = "") -> str:
     """Build the agent system prompt with the given PDB path.
@@ -63,55 +89,133 @@ def make_agent_system_prompt(pdb_path: str, pdb_note: str = "") -> str:
     pdb_note is injected after the PDB line when the file choice was ambiguous —
     it lists all available PDB files so the LLM can pick a more appropriate one.
     """
-    pdb_line = f"       PDB: {pdb_path}"
+    pdb_section = f"PDB: {pdb_path}"
     if pdb_note:
-        pdb_line += (
-            "\n       (or choose a more appropriate file from the list below —\n"
-            f"        the selected path is only a default)\n{pdb_note}"
+        pdb_section += (
+            "\n(The path above is a default — if the listed alternatives suit "
+            f"the function better, use one of them instead.)\n{pdb_note}"
         )
     return f"""\
-You are writing a complete, compilable C++ program (oracle.cc) that observes
-the inputs and outputs of the function given by the user.
+You are writing oracle.cc — a self-contained C++ program that calls ONE
+function and prints its inputs and outputs to stdout in a fixed format.
 
-Requirements for oracle.cc:
-  1. Be self-contained — hardcode the test file paths below, do not use argc/argv.
-{pdb_line}
-       MTZ: {TEST_DATA_DIR}/example.mtz
-  2. Load the structure using the hardcoded path.
-  3. Navigate the structure to reach a valid receiver/input for the function.
-  4. Call the function.
-  5. Print every input value and every meaningful output value:
-       INPUT  <name>: <value>
-       OUTPUT <name>: <value>
-  6. Use this pattern to produce a few edge cases too.
+# Test data
+{pdb_section}
+MTZ: {TEST_DATA_DIR}/example.mtz   (load this ONLY if the target function
+                                    reads map/reflection data)
 
-Proving the function actually ran (critical):
-  Before implementing, read the function source carefully and identify exactly
-  what it modifies or returns. Then:
-  - For functions that return a value: print the return value as OUTPUT.
-  - For void functions that modify a container/vector/map: print its size()
-    or a key element BEFORE and AFTER the call. A before==after result means
-    the function did nothing — your inputs did not satisfy its preconditions.
-  - If the function has guard clauses (if(!x) return; early exits): read them,
-    then set up inputs that pass those guards and reach the core logic.
-  - run_oracle will warn you if no OUTPUT lines are produced — treat that as a
-    test failure and fix the inputs or the print statements.
+# Required output format
+For every input passed to the function and every meaningful output, print
+one line in exactly this form:
 
-Accessing private members (oracle.cc is a test binary — this is always allowed):
-  oracle.cc is compiled with `-fno-access-control`, which disables C++ access
-  checks entirely. You can call private and protected members and read/write
-  private member variables directly. Just write the call as if the member were
-  public — no source-level workaround is needed.
+    INPUT  <name>: <value>
+    OUTPUT <name>: <value>
 
-Mandatory steps before outputting the final program:
-  a. Call resolve_includes on your draft to verify all #include "..." headers.
-  b. Call compile_oracle with your draft — fix all errors and retry until it succeeds.
-  c. Call run_oracle to confirm the program runs and produces INPUT/OUTPUT lines.
-  d. Fix any runtime errors or missing output, recompile, and re-run.
-  e. Only then output the final program in a ```cpp block.
+Example (real working oracle for `coot::molecule_t::cid_to_atom`):
 
-Use C++ code where possible, avoid C style code. Compile your draft as soon as reasonable.
-Don't keep trying to refine if the output is useful.\
+    #include <mmdb2/mmdb_manager.h>
+    #include "api/coot-molecule.hh"
+    #include "api/molecules-container.hh"
+
+    int main() {{
+        molecules_container_t mc;
+        int imol = mc.read_pdb("{pdb_path}");
+        if (imol < 0) {{ std::cerr << "load failed\\n"; return 1; }}
+
+        // case 1: valid atom
+        {{
+            std::string cid = "//A/10/CA";
+            mmdb::Atom *atom = mc[imol].cid_to_atom(cid);
+            std::cout << "INPUT  cid: " << cid << std::endl;
+            std::cout << "OUTPUT atom_found: " << (atom ? "true" : "false") << std::endl;
+            std::cout << "OUTPUT atom_name: "
+                      << (atom ? atom->GetAtomName() : "nullptr") << std::endl;
+        }}
+
+        // case 2: invalid CID — verifies the guarded path
+        {{
+            std::string cid = "//A/9999/N";
+            mmdb::Atom *atom = mc[imol].cid_to_atom(cid);
+            std::cout << "INPUT  cid: " << cid << std::endl;
+            std::cout << "OUTPUT atom_found: " << (atom ? "true" : "false") << std::endl;
+        }}
+        return 0;
+    }}
+
+Cover 2–3 cases (typical + edge) using this pattern. Adapt the receiver
+construction to your target function — `molecules_container_t` + `mc[imol]`
+is the standard entry point for `coot::molecule_t` methods.
+
+# Proving the function actually ran (read this carefully)
+Before you write code, read the function source and identify what it
+returns or mutates. Then:
+- Returns a value → print it as OUTPUT.
+- Void + mutates a container → print container.size() (or a key element)
+  BEFORE and AFTER the call. **If before == after, the function did
+  nothing and your inputs failed its preconditions** — fix the inputs,
+  don't accept a no-op as success.
+- Has guard clauses (`if (!x) return;`) → trace them and construct inputs
+  that pass every guard to reach the core logic.
+
+run_oracle warns when no OUTPUT lines are produced. Treat that warning
+as a hard failure and fix the inputs or the prints.
+
+# Private/protected access
+oracle.cc is compiled with `-fno-access-control` — write private and
+protected member access as if it were public. No friend declarations, no
+casts, no workarounds.
+
+# Workflow — terminal condition
+You are done when ALL of these hold:
+  1. compile_oracle returned success on your latest code.
+  2. run_oracle returned success and the output contains at least one
+     INPUT line and at least one OUTPUT line, with BEFORE != AFTER if the
+     function is void-mutating.
+  3. You have emitted the final program in a single ```cpp fenced block.
+
+Stop after the first run that meets (1) and (2). Do not refine further
+for style — the output is the artifact, not the code.
+
+# Available tools (use ONLY these — do not invent tool names)
+- read_file          — read a C++ source or header file
+- lookup_function    — get source + docs for a function by qualified name
+- lookup_type        — get class/struct definition and method list
+- list_methods       — list all method signatures in a class
+- get_callers        — find functions that call a given function
+- find_header        — resolve a type/function name to its header path
+- resolve_includes   — check which #includes are needed for a code draft
+- search_functions   — find functions by partial name
+- grep_codebase      — text search across the source tree
+- inspect_pdb        — inspect chains/residues in the PDB file
+- get_base_classes   — list base classes of a type
+- find_symbol        — locate a symbol in header files
+- leave_note         — record a domain question for future reference
+- compile_oracle     — compile the current oracle.cc draft
+- run_oracle         — run the compiled oracle binary
+
+# Tool ordering
+- resolve_includes on your draft before the first compile.
+- compile_oracle as soon as you can name the receiver type and one
+  meaningful call site. Compiler errors beat further speculation.
+- run_oracle once it compiles. Fix prints/inputs and recompile if needed.
+
+# When to stop looking up and start writing
+**Hard cap: at most 6 lookup tool calls before your first compile_oracle.**
+Lookups include read_file, lookup_function, lookup_type, list_methods,
+get_callers, search_functions, grep_codebase. After 6 you MUST draft
+oracle.cc and call compile_oracle even if you are uncertain — the
+compiler's errors and run_oracle's output are far more useful than
+further reading. Re-reading the same file or re-looking-up the same
+symbol counts and is wasted; act on what you already know.
+
+Concretely, start writing as soon as you can name: (a) the receiver
+construction pattern (typically `molecules_container_t mc; int imol =
+mc.read_pdb(...)`), (b) one input that should pass the guards, (c) the
+return type or mutation you'll print as OUTPUT. Edge cases can be added
+after the first compile + run succeeds.
+
+Write idiomatic C++ (no malloc/printf/raw C arrays unless the function
+itself returns them).\
 """
 
 
@@ -473,12 +577,18 @@ class _TraceWriter:
     every write so `tail -f` shows progress live during a run.
     """
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Path | None = None, calls_path: Path | None = None) -> None:
         self._lines: list[str] = []
         self._fp = None
+        self._calls_fp = None
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._fp = path.open("w", buffering=1)
+        if calls_path is None and path is not None:
+            calls_path = path.with_name("agent_calls.txt")
+        if calls_path is not None:
+            calls_path.parent.mkdir(parents=True, exist_ok=True)
+            self._calls_fp = calls_path.open("w", buffering=1)
 
     def append(self, line: str) -> None:
         self._lines.append(line)
@@ -490,6 +600,12 @@ class _TraceWriter:
         for line in lines:
             self.append(line)
 
+    def append_call(self, line: str) -> None:
+        """Append a one-liner to the calls-only trace (not the main trace)."""
+        if self._calls_fp is not None:
+            self._calls_fp.write(line + "\n")
+            self._calls_fp.flush()
+
     def text(self) -> str:
         return "\n".join(self._lines)
 
@@ -497,6 +613,9 @@ class _TraceWriter:
         if self._fp is not None:
             self._fp.close()
             self._fp = None
+        if self._calls_fp is not None:
+            self._calls_fp.close()
+            self._calls_fp = None
 
 
 def _is_degenerate_thinking(
@@ -590,6 +709,35 @@ def _has_compile_intent(thinking: str) -> bool:
 
 # ── tool implementations ──────────────────────────────────────────────────────
 
+@functools.lru_cache(maxsize=256)
+def _suggest_paths_by_basename(basename: str, max_hits: int = 5) -> list[str]:
+    """Scan ALLOWED_READ_ROOTS for files matching `basename`. Used to
+    recover from ENOENT in read_file when the model strips a subdir.
+    """
+    if not basename or "/" in basename or "\\" in basename:
+        return []
+    seen: set[str] = set()
+    hits: list[str] = []
+    for root in ALLOWED_READ_ROOTS:
+        root_p = Path(root)
+        if not root_p.is_dir():
+            continue
+        try:
+            for p in root_p.rglob(basename):
+                if not p.is_file():
+                    continue
+                resolved = str(p.resolve())
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                hits.append(str(p))
+                if len(hits) >= max_hits:
+                    return hits
+        except OSError:
+            continue
+    return hits
+
+
 def _tool_read_file(path: str, offset: int = 0, limit: int = 300) -> str:
     real = Path(path).resolve()
     if not any(str(real).startswith(root) for root in ALLOWED_READ_ROOTS):
@@ -602,6 +750,16 @@ def _tool_read_file(path: str, offset: int = 0, limit: int = 300) -> str:
         return f"ERROR: offset/limit must be numeric, got offset={offset!r} limit={limit!r}"
     try:
         text = real.read_text(errors="replace")
+    except FileNotFoundError as e:
+        suggestions = _suggest_paths_by_basename(real.name)
+        msg = f"ERROR: {e}"
+        if suggestions:
+            shown = "\n".join(f"  {p}" for p in suggestions)
+            msg += (
+                f"\nDid you mean one of these (same basename '{real.name}')?\n"
+                f"{shown}"
+            )
+        return msg
     except OSError as e:
         return f"ERROR: {e}"
     lines = text.splitlines()
@@ -667,7 +825,10 @@ _GEMMI_TYPE_HINTS: dict[str, str] = {
     ),
     "gemmi::ResidueId": (
         "Sequence number lives at .seqid.num.value (SeqId nests OptionalInt).\n"
-        "  Insertion code at .seqid.icode (char). NO .num or .icode directly."
+        "  Insertion code at .seqid.icode (char). NO .num or .icode directly.\n"
+        "  ⚠ MMDB uses \"\" (empty string) for no insertion code; gemmi uses ' ' (space).\n"
+        "  std::string(1, icode) for an ordinary residue gives \" \", NOT \"\".\n"
+        "  Normalize before comparing: treat \"\" as equivalent to \" \"."
     ),
     "molecules_container_t": (
         "GLOBAL NAMESPACE — write `molecules_container_t mc;`, NOT\n"
@@ -884,12 +1045,14 @@ def _tool_resolve_includes(code: str) -> str:
             lines.append(f'OK  {shown}  (GCC compiler-internal header)')
             continue
 
-        # Double-quoted includes with no path separator are local/relative
-        # includes — the compiler resolves them from the source file's own
-        # directory (implicit -I.). We can't check them here without knowing
-        # the compile working directory, so accept them unconditionally.
-        if delim == '"' and "/" not in inc:
-            lines.append(f'OK  {shown}  (local relative include — resolved by compiler cwd)')
+        # Sibling files we generate ourselves (function.hh, function.cc,
+        # test.cc, oracle.cc) live alongside the file being compiled — they
+        # don't exist in any allowed source root yet at lint time, so accept
+        # them unconditionally. Any OTHER bare-filename quoted include is
+        # checked against the source tree below.
+        _GENERATED_SIBLINGS = {"function.hh", "function.cc", "test.cc", "oracle.cc"}
+        if delim == '"' and "/" not in inc and inc in _GENERATED_SIBLINGS:
+            lines.append(f'OK  {shown}  (generated sibling file)')
             continue
 
         # Try resolving from each allowed root directly.
@@ -992,7 +1155,10 @@ def _grep_files(pattern: str, roots: list[str], glob: str | None, max_matches: i
         for d in _SKIP_DIRS:
             cmd += ["--glob", f"!**/{d}/**"]
         if glob:
-            cmd += ["--glob", glob]
+            # Ensure path-like globs (containing '/') are matched anywhere in
+            # the tree, not just at the root.
+            rg_glob = glob if glob.startswith("**/") else f"**/{glob}"
+            cmd += ["--glob", rg_glob]
         cmd += [r for r in roots if Path(r).is_dir()]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
@@ -1020,7 +1186,9 @@ def _grep_files(pattern: str, roots: list[str], glob: str | None, max_matches: i
             for fname in filenames:
                 path = Path(dirpath) / fname
                 if glob:
-                    if not fnmatch.fnmatch(fname, glob):
+                    # Match against full relative path so "dir/file.cc" globs work.
+                    rel = str(path.relative_to(root_p))
+                    if not fnmatch.fnmatch(rel, glob) and not fnmatch.fnmatch(fname, glob):
                         continue
                 elif path.suffix not in _GREP_EXTS:
                     continue
@@ -1313,14 +1481,14 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
             proc = subprocess.run(
                 [str(last_binary[0].absolute())],
                 capture_output=True, text=True, cwd=str(oracle_out),
-                timeout=300,
+                timeout=20,
             )
         except subprocess.TimeoutExpired as exc:
             partial = (exc.stdout or "") + (exc.stderr or "")
             if isinstance(partial, bytes):
                 partial = partial.decode(errors="replace")
             return (
-                "FAILED (timed out after 300s — the binary did not exit). "
+                "FAILED (timed out after 20s — the binary did not exit). "
                 "Likely an infinite loop or a blocking call. Partial output:\n"
                 + partial[-2000:]
             )
@@ -1380,7 +1548,17 @@ def _dispatch(
         return _tool_find_symbol(args["symbol"])
     if name == "leave_note":
         return _tool_leave_note(args["topic"], args["question"])
-    return f"Unknown tool: {name}"
+    valid = (
+        "read_file, lookup_function, lookup_type, list_methods, get_callers, "
+        "find_header, resolve_includes, search_functions, grep_codebase, "
+        "inspect_pdb, get_base_classes, find_symbol, leave_note, "
+        "compile_oracle, run_oracle"
+    )
+    return (
+        f"ERROR: '{name}' is not a valid tool. "
+        f"Valid tools: {valid}. "
+        "Do not retry this call — use one of the listed tools instead."
+    )
 
 
 # ── Ollama chat API ───────────────────────────────────────────────────────────
@@ -1518,6 +1696,21 @@ def generate_with_agent(
                 return "Error: compile_oracle called without a 'code' argument."
             return compile_handler(code)
         if name == "run_oracle" and run_handler:
+            if not compiled_ok() and last_draft[0]:
+                compile_msg = compile_handler(last_draft[0])
+                if not compiled_ok():
+                    return (
+                        "run_oracle: no compiled binary was available, so I "
+                        "auto-compiled the most recent draft you provided. "
+                        "Compilation failed — fix the errors below and call "
+                        "compile_oracle with corrected code:\n" + compile_msg
+                    )
+                run_msg = run_handler()
+                return (
+                    "(auto-compiled latest draft before running — "
+                    f"{compile_msg.splitlines()[0] if compile_msg else 'compile ok'})\n"
+                    + run_msg
+                )
             return run_handler()
         if name in ("compile_oracle", "run_oracle"):
             return "Tool unavailable — no output directory configured."
@@ -1572,6 +1765,7 @@ def generate_with_agent(
                     "Use the answer below; do not re-query.)\n"
                 )
                 trace_lines.append(f"  → [cached × {call_counts[key]}] {name}({json.dumps(hash_args)})")
+                trace_lines.append_call(f"[cached × {call_counts[key]}] {name}({json.dumps(hash_args)})")
                 results.append({"role": "tool", "content": note + cached})
                 continue
 
@@ -1583,6 +1777,7 @@ def generate_with_agent(
                 )
                 trace_lines.append(f"  → [repeat-intercept × {call_counts[key]}] {name}({json.dumps(hash_args)})")
                 trace_lines.append(textwrap.indent(nudge, "      ") + "\n")
+                trace_lines.append_call(f"[repeat-intercept × {call_counts[key]}] {name}({json.dumps(hash_args)})")
                 results.append({"role": "tool", "content": nudge})
                 continue
 
@@ -1594,6 +1789,7 @@ def generate_with_agent(
                 result = "\n".join(result_lines[:150]) + f"\n... ({len(result_lines) - 150} more lines)"
             trace_lines.append(f"  → {name}({json.dumps(args)})")
             trace_lines.append(textwrap.indent(result, "      ") + "\n")
+            trace_lines.append_call(f"{name}({json.dumps(args)})")
             if name not in NO_CACHE:
                 tool_cache[key] = result
             results.append({"role": "tool", "content": result})
@@ -1615,6 +1811,7 @@ def generate_with_agent(
     for turn in range(20):
         print(f"  [oracle] turn {turn + 1}/20 ...", end="", flush=True)
         data = _chat(messages, model, tools)
+        _log_llm_timing(data, stage="oracle", turn=turn + 1, verbose=verbose, trace_lines=trace_lines)
         msg  = data.get("message", {})
         tool_calls        = msg.get("tool_calls") or []
         thinking          = msg.get("thinking", "") or ""
@@ -1689,6 +1886,7 @@ def generate_with_agent(
 
         print(f"  [oracle] extension check ...", end="", flush=True)
         data = _chat(messages, model, tools)
+        _log_llm_timing(data, stage="oracle", turn="extension", verbose=verbose, trace_lines=trace_lines)
         msg  = data.get("message", {})
         tool_calls        = msg.get("tool_calls") or []
         thinking          = msg.get("thinking", "") or ""
@@ -1711,6 +1909,7 @@ def generate_with_agent(
             for ext_turn in range(_EXTENSION_TURNS):
                 print(f"  [oracle] ext turn {ext_turn + 1}/{_EXTENSION_TURNS} ...", end="", flush=True)
                 data = _chat(messages, model, tools)
+                _log_llm_timing(data, stage="oracle", turn=f"ext {ext_turn + 1}", verbose=verbose, trace_lines=trace_lines)
                 msg  = data.get("message", {})
                 tool_calls        = msg.get("tool_calls") or []
                 thinking          = msg.get("thinking", "") or ""
@@ -1760,6 +1959,7 @@ def generate_with_agent(
             )})
             try:
                 data = _chat(messages, model, tools=[])
+                _log_llm_timing(data, stage="oracle", turn="rescue", verbose=verbose, trace_lines=trace_lines)
                 assistant_content = (data.get("message") or {}).get("content") or ""
                 trace_lines.append(f"[rescue — response]\n{textwrap.indent(assistant_content, '  ')}\n")
                 rescued = _extract_code(assistant_content)

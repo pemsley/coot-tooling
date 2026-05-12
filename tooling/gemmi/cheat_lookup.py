@@ -19,6 +19,7 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
+from ..db import PROJECT_ROOT, connect, get_function, get_type
 from ..oracle.compile import GEMMI_INCLUDE
 from ..test.compile import GTEST_INCLUDE
 
@@ -340,24 +341,113 @@ def _load_index() -> dict[str, str]:
     return index
 
 
+def _coot_include_for(file_path: str) -> str | None:
+    """Convert an absolute coot-source path to a quoted include directive.
+
+    Returns None if the path is outside PROJECT_ROOT.
+    """
+    try:
+        rel = Path(file_path).resolve().relative_to(Path(PROJECT_ROOT).resolve())
+    except (ValueError, OSError):
+        return None
+    return f'#include "{rel.as_posix()}"'
+
+
+_HEADER_EXTS = (".hh", ".h", ".hpp", ".hxx")
+
+
+def _function_header_path(conn, qn: str) -> str | None:
+    """Look up a function and prefer its declaration file (a header)."""
+    row = conn.execute("""
+        SELECT fi.path AS file, f.is_definition
+        FROM functions f JOIN files fi ON fi.id = f.file_id
+        WHERE f.qualified_name = ?
+    """, (qn,)).fetchall()
+    if not row:
+        return None
+    # Prefer header-extension files; fall back to whatever we have.
+    headers = [r["file"] for r in row if r["file"].endswith(_HEADER_EXTS)]
+    if headers:
+        return headers[0]
+    return row[0]["file"]
+
+
+def _lookup_in_db(symbol: str) -> str | None:
+    """Try resolving a qualified name (type or function) via the code graph DB.
+
+    Returns a `#include "..."` line for coot/clipper symbols, or None if the
+    DB has no record of the name.
+    """
+    try:
+        conn = connect()
+    except Exception:
+        return None
+    try:
+        for qn in (symbol, symbol.lstrip("&*")):
+            t = get_type(conn, qn)
+            if t and t["file"]:
+                inc = _coot_include_for(t["file"])
+                if inc:
+                    return inc
+            fpath = _function_header_path(conn, qn)
+            if fpath:
+                inc = _coot_include_for(fpath)
+                if inc:
+                    return inc
+    finally:
+        conn.close()
+    return None
+
+
 def include_for_symbol(symbol: str) -> str:
     """Return the canonical `#include` directive that defines `symbol`.
 
-    Strips namespaces and trailing call syntax so callers can pass natural
-    forms like 'gemmi::read_pdb_file(' or 'TEST(' and still get a hit.
+    Strips trailing call syntax so callers can pass natural forms like
+    'gemmi::read_pdb_file(' or 'TEST('. For gemmi/gtest symbols this comes
+    from the on-disk header scan; for coot/clipper symbols it falls back to
+    the code graph DB and emits a quote-include relative to PROJECT_ROOT.
     """
     sym = symbol.strip()
     if "(" in sym:
         sym = sym.split("(", 1)[0].strip()
-    if "::" in sym:
-        sym = sym.rsplit("::", 1)[-1]
     if sym.startswith(("&", "*")):
         sym = sym.lstrip("&*").strip()
 
+    # Qualified coot/clipper names — DB only. Never fall through to the
+    # gemmi index: a bare tail like 'matches' or 'name' can collide with
+    # an unrelated gemmi symbol and produce a wrong include.
+    if sym.startswith(("coot::", "clipper::", "ccp4::")):
+        hit = _lookup_in_db(sym)
+        if hit:
+            return hit
+        # Member miss: fall back to the containing class's header — that's
+        # where the method is declared even if the DB didn't index the
+        # method row itself.
+        if sym.count("::") >= 2:
+            parent = sym.rsplit("::", 1)[0]
+            parent_hit = _lookup_in_db(parent)
+            if parent_hit:
+                return (
+                    f"{parent_hit}  // {sym} not indexed directly; "
+                    f"this is the header for its parent class {parent}"
+                )
+        return (
+            f"No header found for '{symbol}' in the code graph DB. "
+            f"Try lookup_type on the parent class, or grep_codebase for "
+            f"the symbol."
+        )
+
+    tail = sym.rsplit("::", 1)[-1] if "::" in sym else sym
     index = _load_index()
-    inc = index.get(sym)
+    inc = index.get(tail)
     if inc:
         return f"#include {inc}"
+
+    # DB fallback for unqualified or other-namespace names.
+    db_hit = _lookup_in_db(sym)
+    if db_hit:
+        return db_hit
+    sym = tail
 
     # Suggest near matches before giving up — saves the agent a follow-up call.
     # Require at least 4 chars of overlap to avoid trivia like 'A' matching

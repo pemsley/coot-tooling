@@ -16,6 +16,7 @@ from ..oracle.agent import (
     _tool_resolve_includes, _has_unresolved_includes,
     _TraceWriter,
     _chat,
+    _log_llm_timing,
     _is_degenerate_thinking,
     NUDGE_EVERY_N_TURNS,
     NO_COMPILE_AFTER,
@@ -25,13 +26,13 @@ from ..oracle.agent import (
 _TEST_NUDGE = (
     "Reminder: when you stop calling tools, your final reply must be a "
     "single ```cpp fenced block containing the complete test.cc. "
-    "If you have a working draft, call compile_test now to validate it."
+    "If you have a working draft, call write_and_compile_test now to validate it."
 )
 
 _TEST_NO_COMPILE_NUDGE = (
-    "WARNING: you have not attempted compile_test yet. "
+    "WARNING: you have not attempted write_and_compile_test yet. "
     "Stop researching and DRAFT your best test.cc now, then call "
-    "compile_test. The compiler's error messages are far more useful "
+    "write_and_compile_test. The compiler's error messages are far more useful "
     "than further speculation. Failures are expected — you have multiple "
     "retries to fix them. Action over analysis."
 )
@@ -42,40 +43,79 @@ from .compile import MAX_COMPILE_ATTEMPTS, compile_test_cc, run_test_binary
 TEST_SYSTEM_PROMPT = """\
 You are converting a C++ oracle program into a Google Test suite (test.cc).
 
-Rules:
-1. Keep all setup code (loading PDB/MTZ, constructing objects, calling the
-   function) identical to the oracle.
-2. For each test case provided, write assertions using the observed values.
-   Choose the assertion type carefully:
-   - Exact integers or booleans: EXPECT_EQ / EXPECT_TRUE / EXPECT_FALSE
-   - Floating-point values: EXPECT_FLOAT_EQ or EXPECT_NEAR, never EXPECT_EQ
-   - Large strings (e.g. PDB file contents): EXPECT_FALSE(s.empty()), size range
-     checks, and EXPECT_NE(s.find("keyword"), std::string::npos) — do NOT
-     hardcode exact byte counts that will break on minor formatting changes
-   - Null/non-null pointers: EXPECT_NE(ptr, nullptr) or EXPECT_EQ(ptr, nullptr)
-   - If the function returns void, assert observable side effects or at minimum
-     assert the function does not crash (the test passes by reaching the end)
-3. If the oracle has multiple test cases, wrap them all in a SINGLE
-   TEST(OracleTest, <FunctionName>) block. Use a nested scope { ... } or a
-   comment to label each case.
-4. Add a main() that calls RUN_ALL_TESTS().
-5. Remove all INPUT/OUTPUT std::cout lines — assertions only.
+# The oracle's printed values are the ground truth
+The numbers, strings, and sizes the oracle printed ARE the correct
+answers. NEVER edit an expected literal to make a failing test pass — if
+an assertion fails, the bug is in your setup or accessor, not the
+expected value. Fix the test, not the oracle.
 
-Accessing private/protected members:
-   test.cc is compiled with `-fno-access-control`. You can call any private
-   or protected method and read/write any private/protected member directly.
+# Structure
+1. Copy the oracle's setup (PDB/MTZ load, object construction, the call
+   itself) verbatim. The only changes from oracle.cc are: remove the
+   INPUT/OUTPUT cout lines, add assertions in their place.
+2. Wrap ALL cases from the oracle in ONE block:
+       TEST(OracleTest, <FunctionName>) { ... }
+   Use inner `{ ... }` scopes (or a `// case: edge` comment) to label
+   each case. Single TEST block keeps the binary small and makes
+   diffing against the gemmi test trivial — do not split into multiple
+   TESTs.
+3. Do NOT write `main()` — gtest_main is linked. Adding `main()` causes
+   a link error.
 
-Mandatory steps before outputting the final program:
-6. Call resolve_includes on your draft FIRST to verify every #include "..."
-   header resolves correctly. Fix any that do not.
-7. Call compile_test with your draft. It compiles and immediately runs the
-   tests — you will see both compiler output and test results in one response.
-   If compilation fails, fix the errors and call again. If tests FAIL, fix
-   the assertions and call compile_test again. Keep iterating until all tests
-   PASS. Call get_compile_errors if the log is truncated.
-8. Output only the final, compiling and passing C++ source in a single ```cpp
-   block.\
+# Choosing assertions
+- Integer / bool / enum  → EXPECT_EQ, EXPECT_TRUE, EXPECT_FALSE
+- Float / double         → EXPECT_NEAR(actual, expected, 1e-4)
+                           (use the oracle's printed precision; never
+                           EXPECT_EQ on floats)
+- Pointer null-ness      → EXPECT_NE(p, nullptr) / EXPECT_EQ(p, nullptr)
+- Large strings (e.g. PDB dumps) → EXPECT_FALSE(s.empty()),
+                           a size range, and
+                           EXPECT_NE(s.find("HEADER"), std::string::npos).
+                           Never hardcode byte counts.
+- Void function, no observable mutation → EXPECT_NO_THROW around the call.
+
+
+# Available tools (use ONLY these — do not invent tool names)
+- read_file              — read a C++ source or header file
+- lookup_function        — get source + docs for a function by qualified name
+- lookup_type            — get class/struct definition and method list
+- list_methods           — list all method signatures in a class
+- get_callers            — find functions that call a given function
+- find_header            — resolve a type/function name to its header path
+- resolve_includes       — check which #includes are needed for a code draft
+- search_functions       — find functions by partial name
+- grep_codebase          — text search across the source tree
+- get_base_classes       — list base classes of a type
+- find_symbol            — locate a symbol in header files
+- write_and_compile_test — write test.cc and compile+run it in one shot
+- run_test               — re-run the last successfully compiled test binary
+- get_compile_errors     — return full (untruncated) compiler output
+
+# Workflow — terminal condition
+You are done when write_and_compile_test's response contains "All tests PASSED"
+AND you have emitted the final program in one ```cpp fenced block.
+
+- Run resolve_includes on your draft before the first write_and_compile_test.
+- write_and_compile_test builds AND runs in one shot — read both compiler output
+  and gtest output from its response.
+- If the log ends with "... more lines truncated", call
+  get_compile_errors before guessing at the fix.
+- If a test FAILS: the literal is right (see top rule). Re-check your
+  accessor, your inputs, or whether you're calling the same overload as
+  the oracle.
+
+# Insertion-code caveat (MMDB vs gemmi)
+MMDB represents "no insertion code" as "" (empty string); gemmi stores
+`seqid.icode` as ' ' (space char), matching the raw PDB column.
+`std::string(1, residue.seqid.icode)` for a plain residue gives " ", NOT "".
+When asserting insertion codes, use " " (one space), not "", in gemmi-based
+tests. In MMDB-based (oracle-derived) tests use whatever the oracle printed.\
 """
+
+# # Private/protected access
+# test.cc is compiled with `-fno-access-control`. Write private/protected
+# member access as if it were public. No friend declarations needed.
+
 
 _RUN_TEST_TOOL = {
     "type": "function",
@@ -83,7 +123,7 @@ _RUN_TEST_TOOL = {
         "name": "run_test",
         "description": (
             "Run the last successfully compiled test binary and return the "
-            "GoogleTest output. Use this after compile_test succeeds to check "
+            "GoogleTest output. Use this after write_and_compile_test succeeds to check "
             "for failing assertions. Fix any EXPECT_EQ mismatches and recompile."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
@@ -93,7 +133,7 @@ _RUN_TEST_TOOL = {
 _COMPILE_TEST_TOOL = {
     "type": "function",
     "function": {
-        "name": "compile_test",
+        "name": "write_and_compile_test",
         "description": (
             "Write the supplied C++ code as test.cc and attempt to compile it. "
             "Returns compiler output. Fix any errors shown and call again. "
@@ -118,8 +158,8 @@ _GET_COMPILE_ERRORS_TOOL = {
     "function": {
         "name": "get_compile_errors",
         "description": (
-            "Return the full compiler output from the last compile_test call, "
-            "without any line truncation. Use this when compile_test showed "
+            "Return the full compiler output from the last write_and_compile_test call, "
+            "without any line truncation. Use this when write_and_compile_test showed "
             "'... N more lines truncated'."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
@@ -129,8 +169,8 @@ _GET_COMPILE_ERRORS_TOOL = {
 TEST_TOOLS = TOOLS + [_COMPILE_TEST_TOOL, _RUN_TEST_TOOL, _GET_COMPILE_ERRORS_TOOL]
 
 
-def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable]:
-    """Return (compile_handler, run_handler, get_errors_handler) sharing state about the last build."""
+def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable, callable]:
+    """Return (compile_handler, run_handler, get_errors_handler, compiled_ok) sharing state about the last build."""
     attempts       = [0]
     last_binary    = [None]   # Path | None — set when a compile succeeds
     last_error_log = [None]   # Path | None
@@ -148,7 +188,7 @@ def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable
             return (
                 "Include check FAILED (this does not count against your "
                 f"{MAX_COMPILE_ATTEMPTS} compile attempts). Fix the paths "
-                "below and call compile_test again:\n"
+                "below and call write_and_compile_test again:\n"
                 + include_report
             )
 
@@ -173,14 +213,13 @@ def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable
 
         if success:
             last_binary[0] = test_bin
-            run_ok, run_out = run_test_binary(test_bin)
-            run_lines = run_out.splitlines()
-            if len(run_lines) > 100:
-                run_out = "\n".join(run_lines[:100]) + f"\n... ({len(run_lines) - 100} more lines)"
-            status = "All tests PASSED." if run_ok else "Some tests FAILED — fix the assertions and recompile."
+        #     run_ok, run_out = run_test_binary(test_bin)
+        #     run_lines = run_out.splitlines()
+        #     if len(run_lines) > 100:
+        #         run_out = "\n".join(run_lines[:100]) + f"\n... ({len(run_lines) - 100} more lines)"
+            # status = "All tests PASSED." if run_ok else "Some tests FAILED — fix the assertions and recompile."
             return (
                 f"Compilation succeeded (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS}).\n"
-                f"{status}\n{run_out}"
             )
         last_binary[0] = None
         last_error_log[0] = error_log
@@ -188,7 +227,7 @@ def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable
 
     def run_handler() -> str:
         if last_binary[0] is None:
-            return "No compiled binary available — call compile_test first."
+            return "No compiled binary available — call write_and_compile_test first."
         success, output = run_test_binary(last_binary[0])
         lines = output.splitlines()
         if len(lines) > 100:
@@ -201,7 +240,10 @@ def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable
             return "No compile error log available."
         return last_error_log[0].read_text()
 
-    return compile_handler, run_handler, get_errors_handler
+    def compiled_ok() -> bool:
+        return last_binary[0] is not None
+
+    return compile_handler, run_handler, get_errors_handler, compiled_ok
 
 
 
@@ -220,12 +262,27 @@ def generate_test_with_agent(
     Returns (test_code, trace_text).
     test_code is None if the model produced nothing usable.
     """
-    compile_handler, run_handler, get_errors_handler = _make_tool_handlers(test_subdir)
+    compile_handler, run_handler, get_errors_handler, compiled_ok = _make_tool_handlers(test_subdir)
 
     def dispatch(name: str, args: dict) -> str:
-        if name == "compile_test":
+        if name == "write_and_compile_test":
             return compile_handler(args["code"])
         if name == "run_test":
+            if not compiled_ok() and last_draft[0]:
+                compile_msg = compile_handler(last_draft[0])
+                if not compiled_ok():
+                    return (
+                        "run_test: no compiled binary was available, so I "
+                        "auto-compiled the most recent draft you provided. "
+                        "Compilation failed — fix the errors below and call "
+                        "write_and_compile_test with corrected code:\n" + compile_msg
+                    )
+                run_msg = run_handler()
+                return (
+                    "(auto-compiled latest draft before running — "
+                    f"{compile_msg.splitlines()[0] if compile_msg else 'compile ok'})\n"
+                    + run_msg
+                )
             return run_handler()
         if name == "get_compile_errors":
             return get_errors_handler()
@@ -241,14 +298,14 @@ def generate_test_with_agent(
     parts.append(f"```\n{oracle_result.stdout.rstrip()}\n```")
 
     # Compact oracle trace summary (tool calls only)
-    if oracle_trace:
-        tool_lines = [l.strip() for l in oracle_trace.splitlines() if l.strip().startswith("→")]
-        if tool_lines:
-            parts.append("## Oracle lookups already verified")
-            parts.append("_Types and headers confirmed during oracle generation._")
-            shown = tool_lines[:20]
-            suffix = f"\n... ({len(tool_lines) - 20} more)" if len(tool_lines) > 20 else ""
-            parts.append("```\n" + "\n".join(shown) + suffix + "\n```")
+    # if oracle_trace:
+    #     tool_lines = [l.strip() for l in oracle_trace.splitlines() if l.strip().startswith("→")]
+    #     if tool_lines:
+    #         parts.append("## Oracle lookups already verified")
+    #         parts.append("_Types and headers confirmed during oracle generation._")
+    #         shown = tool_lines[:20]
+    #         suffix = f"\n... ({len(tool_lines) - 20} more)" if len(tool_lines) > 20 else ""
+    #         parts.append("```\n" + "\n".join(shown) + suffix + "\n```")
 
     # Oracle-derived notes, if the oracle stage produced any.
     notes = load_notes(test_subdir.parent / "oracle" / "notes.json")
@@ -288,7 +345,7 @@ def generate_test_with_agent(
     call_counts: dict[str, int] = {}
     tool_cache: dict[str, str] = {}
     REPEAT_LIMIT = 3
-    NO_CACHE = {"compile_test", "run_test", "get_compile_errors", "leave_note"}
+    NO_CACHE = {"write_and_compile_test", "run_test", "get_compile_errors", "leave_note"}
     no_compile_warned = [False]
 
     def _save_draft(code: str) -> None:
@@ -306,7 +363,7 @@ def generate_test_with_agent(
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {}
-            if name == "compile_test" and isinstance(args.get("code"), str):
+            if name == "write_and_compile_test" and isinstance(args.get("code"), str):
                 _save_draft(args["code"])
             hash_args = {k: v for k, v in args.items() if k != "code"}
             key = f"{name}:{json.dumps(hash_args, sort_keys=True)}"
@@ -318,19 +375,21 @@ def generate_test_with_agent(
                     "Use the answer below; do not re-query.)\n"
                 )
                 trace_lines.append(f"  → [cached × {call_counts[key]}] {name}({json.dumps(hash_args)})")
+                trace_lines.append_call(f"[cached × {call_counts[key]}] {name}({json.dumps(hash_args)})")
                 results.append({"role": "tool", "content": note + cached})
                 continue
-            if call_counts[key] > REPEAT_LIMIT and name not in ("compile_test", "run_test"):
+            if call_counts[key] > REPEAT_LIMIT and name not in ("write_and_compile_test", "run_test"):
                 nudge = (
                     f"You have called {name} with these arguments {call_counts[key]} times. "
                     "Stop repeating — use the information you already have and proceed to "
-                    "compile_test with your best draft."
+                    "write_and_compile_test with your best draft."
                 )
                 trace_lines.append(f"  → {name}(repeated — nudged)")
+                trace_lines.append_call(f"[repeat-intercept] {name}({json.dumps(hash_args)})")
                 results.append({"role": "tool", "content": nudge})
                 continue
             if verbose:
-                display = {"code": "..."} if name == "compile_test" else args
+                display = {"code": "..."} if name == "write_and_compile_test" else args
                 print(f"  tool: {name}({display})")
             result_text  = dispatch(name, args)
             result_lines = result_text.splitlines()
@@ -339,10 +398,10 @@ def generate_test_with_agent(
                     "\n".join(result_lines[:150])
                     + f"\n... ({len(result_lines) - 150} more lines)"
                 )
-            trace_lines.append(
-                f"  → {name}({json.dumps(args) if name != 'compile_test' else '{...}'})"
-            )
+            short = json.dumps(args) if name != 'write_and_compile_test' else '{...}'
+            trace_lines.append(f"  → {name}({short})")
             trace_lines.append(textwrap.indent(result_text, "      ") + "\n")
+            trace_lines.append_call(f"{name}({short})")
             if name not in NO_CACHE:
                 tool_cache[key] = result_text
             results.append({"role": "tool", "content": result_text})
@@ -367,6 +426,7 @@ def generate_test_with_agent(
     for turn in range(20):
         print(f"  [test] turn {turn + 1}/20 ...", end="", flush=True)
         data = _chat(messages, model, TEST_TOOLS)
+        _log_llm_timing(data, stage="test", turn=turn + 1, verbose=verbose, trace_lines=trace_lines)
         msg  = data.get("message", {})
         tool_calls        = msg.get("tool_calls") or []
         thinking          = msg.get("thinking",  "") or ""
@@ -409,7 +469,7 @@ def generate_test_with_agent(
 
         if (NO_COMPILE_AFTER and not no_compile_warned[0]
                 and (turn + 1) >= NO_COMPILE_AFTER
-                and not any(k.startswith("compile_test:") for k in call_counts)):
+                and not any(k.startswith("write_and_compile_test:") for k in call_counts)):
             messages.append({"role": "user", "content": _TEST_NO_COMPILE_NUDGE})
             trace_lines.append(f"[no-compile nudge — turn {turn + 1}]\n{textwrap.indent(_TEST_NO_COMPILE_NUDGE, '  ')}\n")
             no_compile_warned[0] = True
@@ -426,6 +486,7 @@ def generate_test_with_agent(
 
         print(f"  [test] extension check ...", end="", flush=True)
         data = _chat(messages, model, TEST_TOOLS)
+        _log_llm_timing(data, stage="test", turn="extension", verbose=verbose, trace_lines=trace_lines)
         msg  = data.get("message", {})
         tool_calls        = msg.get("tool_calls") or []
         thinking          = msg.get("thinking",  "") or ""
@@ -450,6 +511,7 @@ def generate_test_with_agent(
             for ext_turn in range(_EXTENSION_TURNS):
                 print(f"  [test] ext turn {ext_turn + 1}/{_EXTENSION_TURNS} ...", end="", flush=True)
                 data = _chat(messages, model, TEST_TOOLS)
+                _log_llm_timing(data, stage="test", turn=f"ext {ext_turn + 1}", verbose=verbose, trace_lines=trace_lines)
                 msg  = data.get("message", {})
                 tool_calls        = msg.get("tool_calls") or []
                 thinking          = msg.get("thinking",  "") or ""
@@ -477,7 +539,7 @@ def generate_test_with_agent(
                 messages.extend(_run_tool_calls(tool_calls))
 
                 if (NO_COMPILE_AFTER and not no_compile_warned[0]
-                        and not any(k.startswith("compile_test:") for k in call_counts)):
+                        and not any(k.startswith("write_and_compile_test:") for k in call_counts)):
                     messages.append({"role": "user", "content": _TEST_NO_COMPILE_NUDGE})
                     trace_lines.append(f"[no-compile nudge — ext turn {ext_turn + 1}]\n{textwrap.indent(_TEST_NO_COMPILE_NUDGE, '  ')}\n")
                     no_compile_warned[0] = True
@@ -501,6 +563,7 @@ def generate_test_with_agent(
             )})
             try:
                 data = _chat(messages, model, tools=[])
+                _log_llm_timing(data, stage="test", turn="rescue", verbose=verbose, trace_lines=trace_lines)
                 assistant_content = (data.get("message") or {}).get("content") or ""
                 trace_lines.append(
                     f"[assistant — rescue]\n{textwrap.indent(assistant_content, '  ')}\n"

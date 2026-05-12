@@ -5,7 +5,8 @@ The agent produces a gemmi equivalent of the function AND a gemmi version of
 the test that exercises it — compiled and linked as a single unit so
 signatures agree by construction.
 
-Frozen: every EXPECT_* / ASSERT_* line from the original test.
+Frozen: the RHS literal (expected value) of every multi-arg EXPECT_* / ASSERT_*
+in the original test. LHS accessors may be rewritten when the type changes.
 """
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ from ..oracle.agent import (
     _tool_grep_codebase,
     _TraceWriter,
     _chat,
+    _log_llm_timing,
     _is_degenerate_thinking,
     _has_compile_intent,
     NUDGE_EVERY_N_TURNS,
@@ -42,16 +44,17 @@ _GEMMI_NUDGE = (
     "  ```cpp:function.cc          (optional — only if needed)\n  ...\n  ```\n"
     "  ```cpp:test.cc\n  ...\n  ```\n"
     "Do not summarise. Do not narrate. If you have a working draft, call "
-    "compile_gemmi NOW to validate it before finalising."
+    "write_gemmi_file NOW for function.hh and then test.cc — writing "
+    "test.cc auto-compiles and validates the port."
 )
 
 _GEMMI_NO_COMPILE_NUDGE = (
-    "WARNING: you have not attempted compile_gemmi yet. "
-    "Stop researching and DRAFT your best function.hh + test.cc (and "
-    "optionally function.cc) NOW, then call compile_gemmi. The compiler's "
-    "error messages are far more useful than further speculation about "
-    "gemmi APIs. Failures are expected — you have multiple retries to fix "
-    "them. Action over analysis."
+    "WARNING: you have not started writing files yet. "
+    "STOP looking things up. Call write_gemmi_file with your best draft "
+    "of function.hh, then write_gemmi_file with test.cc — writing test.cc "
+    "triggers an automatic compile and you will get real compiler errors "
+    "to act on. Further file reads and lookups are now LESS useful than "
+    "a failed compile. Action over analysis."
 )
 from ..oracle.compile import GEMMI_INCLUDE
 from ..oracle.notes import load_notes, render_notes_for_prompt
@@ -130,6 +133,184 @@ def _gemmi_target_name(qname: str) -> str:
     return f"{qname}_gemmi"
 
 
+def _all_gemmi_ports(conn: sqlite3.Connection) -> list[str]:
+    """Return all coot qualified names that have a verified gemmi port.
+
+    A port is "verified" when `<sanitized>/gemmi/function.hh` exists — see
+    `_has_gemmi_port`. `sanitize_name` is lossy so we recover qnames by
+    matching against the DB's distinct qualified_name set.
+    """
+    ported_dirs = {
+        p.parent.parent.name
+        for p in OUT_ROOT.glob("*/gemmi/function.hh")
+    }
+    if not ported_dirs:
+        return []
+    rows = conn.execute("SELECT DISTINCT qualified_name FROM functions").fetchall()
+    by_sanitized: dict[str, str] = {}
+    for (q,) in rows:
+        by_sanitized.setdefault(sanitize_name(q), q)
+    return sorted({by_sanitized[d] for d in ported_dirs if d in by_sanitized})
+
+
+_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_NAMESPACE_OPEN_RE = re.compile(r"namespace\s+([A-Za-z_]\w*)\s*\{")
+_GEMMI_DECL_RE = re.compile(r"([A-Za-z_]\w*_gemmi)\s*\(")
+
+
+def _parse_gemmi_decls(header_path: Path) -> list[dict]:
+    """Extract every `*_gemmi(...)` declaration from a generated header.
+
+    Returns one dict per declaration with the real qualified name (built
+    from the surrounding `namespace X {` stack) and the signature text
+    (return type through closing `)`, whitespace normalised). We parse the
+    source rather than predicting because the agent may have put the port
+    in any namespace — `coot::molecule_t::foo` often ports to a free
+    `coot::foo_gemmi`, and `_gemmi_target_name` is only a guess.
+    """
+    try:
+        text = header_path.read_text()
+    except OSError:
+        return []
+    text = _LINE_COMMENT_RE.sub("", text)
+    text = _BLOCK_COMMENT_RE.sub("", text)
+
+    results: list[dict] = []
+    stack: list[tuple[int, str]] = []   # (brace depth when opened, ns name)
+    depth = 0
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "{":
+            depth += 1
+            i += 1
+            continue
+        if c == "}":
+            while stack and stack[-1][0] == depth:
+                stack.pop()
+            depth -= 1
+            i += 1
+            continue
+        m = _NAMESPACE_OPEN_RE.match(text, i)
+        if m:
+            depth += 1
+            stack.append((depth, m.group(1)))
+            i = m.end()
+            continue
+        m = _GEMMI_DECL_RE.match(text, i)
+        if m:
+            # Only treat this as a declaration if we're directly inside a
+            # namespace (or at file scope) — NOT inside another function
+            # body. Otherwise we'd pick up call-sites like
+            # `gemmi::Residue* p = cid_to_residue_gemmi(...)` as decls.
+            ns_depth = stack[-1][0] if stack else 0
+            if depth != ns_depth:
+                i = m.end()
+                continue
+            # Forward to the matching ')'.
+            j, pdepth = m.end(), 1
+            while j < n and pdepth > 0:
+                if text[j] == "(":
+                    pdepth += 1
+                elif text[j] == ")":
+                    pdepth -= 1
+                j += 1
+            # Backward to the start of the declaration.
+            back = i
+            while back > 0 and text[back - 1] not in ";{}":
+                back -= 1
+            signature = re.sub(r"\s+", " ", text[back:j].strip())
+            ns = "::".join(name for _, name in stack)
+            qname = f"{ns}::{m.group(1)}" if ns else m.group(1)
+            results.append({"qname": qname, "signature": signature})
+            i = j
+            continue
+        i += 1
+
+    seen, out = set(), []
+    for r in results:
+        if r["qname"] in seen:
+            continue
+        seen.add(r["qname"])
+        out.append(r)
+    return out
+
+
+def _port_entry(qname: str) -> dict:
+    """Render a single port as the structured dict returned by the tool.
+
+    `qname` here is the ORIGINAL MMDB function's qname (the directory's
+    source). The actual ported callable(s) are parsed from function.hh.
+    """
+    header = OUT_ROOT / sanitize_name(qname) / "gemmi" / "function.hh"
+    return {
+        "source_qname": qname,
+        "header": str(header),
+        "decls": _parse_gemmi_decls(header),
+    }
+
+
+def _find_gemmi_ports(conn: sqlite3.Connection, name: str) -> list[dict]:
+    """Match `name` (bare or qualified) against verified ports.
+
+    Matches against the original MMDB qname (the dir's source) AND against
+    the parsed gemmi declaration qnames (since the port may live in a
+    different namespace than the original). Exact matches win; otherwise
+    falls back to case-insensitive substring search.
+    """
+    name = (name or "").strip()
+    if not name:
+        return []
+    sources = _all_gemmi_ports(conn)
+    entries = [_port_entry(q) for q in sources]
+    bare = name.rsplit("::", 1)[-1]
+
+    def _matches_exact(e: dict) -> bool:
+        if e["source_qname"] == name or e["source_qname"].rsplit("::", 1)[-1] == bare:
+            return True
+        for d in e["decls"]:
+            dq = d["qname"]
+            if dq == name or dq.rsplit("::", 1)[-1] == bare:
+                return True
+            # Also match against the bare name minus the _gemmi suffix.
+            if dq.rsplit("::", 1)[-1] == f"{bare}_gemmi":
+                return True
+        return False
+
+    exact = [e for e in entries if _matches_exact(e)]
+    if exact:
+        return exact
+    lower = name.lower()
+
+    def _matches_loose(e: dict) -> bool:
+        if lower in e["source_qname"].lower():
+            return True
+        return any(lower in d["qname"].lower() for d in e["decls"])
+
+    return [e for e in entries if _matches_loose(e)]
+
+
+def _format_ports_for_tool(entries: list[dict]) -> str:
+    """Human-readable rendering returned to the agent."""
+    if not entries:
+        return ("No verified gemmi port found. The callee may not be ported "
+                "yet — translate inline using gemmi primitives.")
+    out = []
+    for e in entries:
+        out.append(f"Port of `{e['source_qname']}`:")
+        out.append(f'  #include "{e["header"]}"')
+        if e["decls"]:
+            out.append("  Call as:")
+            for d in e["decls"]:
+                out.append(f"    {d['qname']}")
+                out.append(f"      signature: {d['signature']}")
+        else:
+            out.append("  (no `*_gemmi` declarations found in header)")
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
 def _transitive_ported_deps(
     conn: sqlite3.Connection, qname: str,
 ) -> list[str]:
@@ -180,6 +361,167 @@ def _extract_test_fixtures(test_cc: str) -> list[str]:
             seen.append(path)
     return seen
 
+
+_ASSERTION_MACRO_RE = re.compile(r'\b(EXPECT_[A-Z]+|ASSERT_[A-Z]+)\s*\(')
+
+
+def _split_top_level_args(arglist: str) -> list[str]:
+    """Split a comma-separated argument list on top-level commas only,
+    respecting (), [], {}, and "..." / '...' string/char literals.
+    Angle brackets are NOT tracked because '<' / '>' are ambiguous with
+    comparison and arrow (`->`) operators in C++ expressions."""
+    args: list[str] = []
+    depth_paren = depth_brack = depth_brace = 0
+    in_str: str | None = None
+    buf: list[str] = []
+    i = 0
+    while i < len(arglist):
+        ch = arglist[i]
+        if in_str:
+            buf.append(ch)
+            if ch == '\\' and i + 1 < len(arglist):
+                buf.append(arglist[i + 1])
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+        elif ch in ('"', "'"):
+            in_str = ch
+            buf.append(ch)
+        elif ch == '(':
+            depth_paren += 1; buf.append(ch)
+        elif ch == ')':
+            depth_paren -= 1; buf.append(ch)
+        elif ch == '[':
+            depth_brack += 1; buf.append(ch)
+        elif ch == ']':
+            depth_brack -= 1; buf.append(ch)
+        elif ch == '{':
+            depth_brace += 1; buf.append(ch)
+        elif ch == '}':
+            depth_brace -= 1; buf.append(ch)
+        elif (ch == ',' and depth_paren == 0 and depth_brack == 0
+              and depth_brace == 0):
+            args.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    if buf:
+        args.append("".join(buf).strip())
+    return args
+
+
+def _extract_assertion_rhs_literals(src: str) -> list[tuple[str, str]]:
+    """Return (macro_name, rhs_literal) pairs for each multi-arg EXPECT_*/ASSERT_*
+    found in the source. Single-arg macros (EXPECT_TRUE, ASSERT_FALSE, ...) and
+    no-op state-of-load asserts whose RHS is trivial (0, nullptr, NULL, true,
+    false) are skipped — they convey no expected-value information, only sanity
+    that loading succeeded, which has no MMDB↔gemmi equivalence."""
+    trivial_rhs = {"0", "nullptr", "NULL", "true", "false"}
+    out: list[tuple[str, str]] = []
+    for m in _ASSERTION_MACRO_RE.finditer(src):
+        macro = m.group(1)
+        # Walk forward from the opening '(' to find the matching ')'.
+        start = m.end()  # position after '('
+        depth = 1
+        in_str: str | None = None
+        i = start
+        while i < len(src) and depth > 0:
+            ch = src[i]
+            if in_str:
+                if ch == '\\' and i + 1 < len(src):
+                    i += 2
+                    continue
+                if ch == in_str:
+                    in_str = None
+            elif ch in ('"', "'"):
+                in_str = ch
+            elif ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            i += 1
+        if depth != 0:
+            continue
+        inner = src[start:i - 1]
+        args = _split_top_level_args(inner)
+        if len(args) < 2:
+            continue
+        rhs = args[-1]
+        if rhs in trivial_rhs:
+            continue
+        out.append((macro, rhs))
+    return out
+
+
+def _normalize_rhs_literal(rhs: str) -> str:
+    """Reduce an RHS literal to a comparable canonical form so semantically
+    equivalent values match across the MMDB→gemmi port. Examples that collapse
+    to the same key:
+      `"H"`  ≡  `'H'`            (string vs char)
+      `1.0`  ≡  `1.0f`  ≡  `1.`  (numeric suffix / trailing zeros)
+      `42`   ≡  `42u`   ≡  `42L` (integer suffix)
+      `  "x" ` ≡ `"x"`           (whitespace)
+    Non-literal expressions fall through unchanged."""
+    s = rhs.strip()
+    if not s:
+        return s
+    # String / char literal: strip enclosing quotes (and any prefix like u8, L).
+    m = re.match(r'^(?:u8|u|U|L)?(["\'])(.*)\1$', s, re.DOTALL)
+    if m:
+        return m.group(2)
+    # Numeric: try to parse after stripping common suffixes.
+    num = re.sub(r'[uUlLfF]+$', '', s)
+    try:
+        f = float(num)
+        if f == int(f) and 'e' not in num.lower() and '.' not in num:
+            return str(int(f))
+        return f"{f:.6g}"
+    except ValueError:
+        pass
+    return s
+
+
+def _check_assertions_unchanged(original_test_cc: str, proposed_test_cc: str) -> str | None:
+    """Return a warning message if any RHS literal frozen by the original test
+    is absent from the proposed test (after semantic normalization), else None.
+
+    Only the expected value (last arg) is checked — LHS accessors may be
+    rewritten when the type changes (e.g. `res->GetSeqNum()` → `res->seqid.num.value`).
+    The macro name itself is also free to change (e.g. EXPECT_STREQ → EXPECT_EQ
+    when porting `const char*` → `std::string`).
+
+    Matching is semantic: `"H"` matches `'H'`, `1.0` matches `1.0f`, `42`
+    matches `42u`. If the RHS only differs cosmetically the check passes.
+    Trivial RHS values (0, nullptr, true, false) are excluded — they tend to
+    mark load-state checks with no gemmi analogue."""
+    original = _extract_assertion_rhs_literals(original_test_cc)
+    proposed_rhs_norm = {
+        _normalize_rhs_literal(rhs)
+        for _, rhs in _extract_assertion_rhs_literals(proposed_test_cc)
+    }
+    missing = sorted({
+        rhs for _, rhs in original
+        if _normalize_rhs_literal(rhs) not in proposed_rhs_norm
+    })
+    if not missing:
+        return None
+    sample = "\n".join(missing[:5])
+    tail = f"\n  … and {len(missing) - 5} more" if len(missing) > 5 else ""
+    return (
+        "ASSERTION CHECK: your test.cc is missing the following expected RHS "
+        "literal values from the original test:\n\n"
+        + sample + tail + "\n\n"
+        "The RHS should match the original — LHS accessors may change, but the "
+        "expected value should be asserted somewhere. If your RHS is "
+        "semantically equivalent (e.g. `\"H\"` vs `'H'`, `1.0` vs `1.0f`, an "
+        "equivalent numeric expression, or a constant that evaluates to the "
+        "same value) this is fine and you may proceed. Otherwise, fix your "
+        "FUNCTION IMPLEMENTATION so it produces these values."
+    )
+
+
 GEMMI_CHEAT_SHEET = """\
 ## gemmi quick reference (verified against the installed headers)
 
@@ -206,12 +548,18 @@ Traversal — every level is a std::vector, so you iterate, not GetXxx():
   for (gemmi::Residue& residue : chain.residues)
   for (gemmi::Atom&    atom    : residue.atoms) { ... }
 
-Most-used MMDB → gemmi accessors (call mmdb_to_gemmi("Name") for any others):
+Most-used MMDB → gemmi accessors (use the mmdb_to_gemmi tool with method="<Name>" for any others):
   mol->GetModel(1)                → st.models[0]            // 0-indexed!
   chain->GetChainID()             → chain.name              // field, not method
   residue->GetResName()           → residue.name            // field
   residue->GetSeqNum()            → residue.seqid.num.value
   residue->GetInsCode()           → residue.seqid.icode     // char, not const char*
+  // ⚠ INSERTION CODE MISMATCH: MMDB uses "" (empty string) for "no insertion
+  //   code"; gemmi uses ' ' (space char), matching the raw PDB column.
+  //   std::string(1, residue.seqid.icode) for a plain residue gives " ", NOT "".
+  //   Always normalize before comparing:
+  //     auto norm = [](const std::string& ic){ return ic.empty() ? std::string(" ") : ic; };
+  //     if (norm(query_ic) == std::string(1, residue.seqid.icode)) { ... }
   atom->GetAtomName()             → atom.name               // std::string field
   atom->GetElementName()          → atom.element.name()     // "C","O" — unpadded
   atom->x, atom->y, atom->z       → atom.pos.x, atom.pos.y, atom.pos.z
@@ -219,7 +567,7 @@ Most-used MMDB → gemmi accessors (call mmdb_to_gemmi("Name") for any others):
   atom->tempFactor                → atom.b_iso
   chain->GetNumberOfResidues()    → chain.residues.size()
   residue->GetNumberOfAtoms()     → residue.atoms.size()
-  ... (~200 more — call mmdb_to_gemmi("<MethodName>") for any MMDB API.
+  ... (~200 more — use the mmdb_to_gemmi tool with method="<MethodName>" for any MMDB API.
        The catalog covers Manager/Model/Chain/Residue/Atom getters,
        setters, and NO_EQUIVALENT explanations.)
 
@@ -303,6 +651,10 @@ GEMMI_ANTIPATTERNS = """\
 
   ❌ Fractional.u / .v / .w        → ✅ Fractional.x / .y / .z   (inherits Vec3)
   ❌ ResidueId.num / .icode        → ✅ ResidueId.seqid.num.value / .seqid.icode
+  ❌ query_ic == std::string(1, r.seqid.icode)  // breaks when query_ic="" and icode=' '
+     → ✅ normalize: MMDB "" and gemmi ' ' both mean "no insertion code":
+          auto norm=[](const std::string& s){ return s.empty() ? std::string(" ") : s; };
+          norm(query_ic) == std::string(1, r.seqid.icode)
   ❌ Atom.alt_loc                  → ✅ Atom.altloc   (no underscore)
   ❌ Structure.links               → ✅ Structure.connections
   ❌ Structure.space_group         → ✅ Structure.spacegroup_hm
@@ -347,78 +699,158 @@ int main(int argc, char** argv) {
 }
 ```
 
-If you're unsure which header declares a name, call **include_for_symbol("Foo")**
-— authoritative answer, no grep needed. For an MMDB → gemmi method mapping,
-call **mmdb_to_gemmi("GetSeqNum")** before grep'ing.\
+If you're unsure which header declares a name, use the **include_for_symbol**
+tool (symbol="Foo") — authoritative answer, no grep needed. For an MMDB →
+gemmi method mapping, use the **mmdb_to_gemmi** tool (method="GetSeqNum")
+before grep'ing.\
 """
 
 GEMMI_SYSTEM_PROMPT = f"""\
 You are porting ONE C++ function from the MMDB API to the gemmi API AND
 translating its Google Test, in the same session.
 
-{GEMMI_CHEAT_SHEET}
+# Artifacts to produce
+A. function.hh — `#pragma once`, declaration, `#include <gemmi/...>` deps.
+   If the body is short, define it inline here.
+B. function.cc — OPTIONAL. Only emit if the body is long or uses
+   translation-unit-private helpers. Skip otherwise.
+C. test.cc — the gemmi-translated Google Test. Must `#include "function.hh"`.
 
-## Artifacts to produce
+**The function MUST be defined somewhere — either inline in function.hh
+or out-of-line in function.cc. A declaration-only function.hh with no
+function.cc will fail to link (undefined reference). When in doubt,
+inline the body in function.hh.**
 
-  A. function.hh — header with declaration and #include <gemmi/...> deps.
-     Use `#pragma once`. If the body is short, put it here as `inline`.
-  B. function.cc — OPTIONAL. Only emit if the body is long or uses
-     translation-unit-private helpers. Otherwise omit it entirely.
-  C. test.cc — the gemmi-translated Google Test, #include "function.hh".
+# Naming (read this before anything else)
+The user's task message states the exact target name — use it verbatim.
+Rule: keep the original namespace, append `_gemmi` to the function name.
 
-## Rules
+    Original:  coot::angle(...)
+    Ported:    coot::angle_gemmi(...)        ✓
+    Wrong:     gemmi::angle(...)             ✗  (no gemmi:: namespace)
+    Wrong:     coot::gemmi::angle(...)       ✗  (no nested wrapper)
+    Wrong:     coot::angle(...)              ✗  (missing _gemmi suffix)
 
-1. Preserve every EXPECT_* / ASSERT_* line's semantic fact — same compared
-   value, same comparison operator. You MAY rewrite the left-hand-side
-   accessor when the type changes (e.g. `res->GetSeqNum()` becomes
-   `res->seqid.num.value`), but you MAY NOT change the expected value or
-   relax the check. The original expected numbers are the correctness
-   oracle.
-2. Port the function semantics 1:1 — same output for the same input.
-3. **Naming**: keep the original function's C++ namespace exactly as-is and
-   append `_gemmi` to the function name. For example, if the original is
-   `coot::angle(...)` the ported function MUST be declared and defined as
-   `coot::angle_gemmi(...)`. Do NOT wrap it in a `gemmi::` namespace or any
-   other namespace. The task below states the exact target name — use it
-   verbatim.
-4. The function signature must match what test.cc calls. Design them together.
-5. Use the DB tools (lookup_type, list_methods, find_header, find_symbol)
-   BEFORE writing any gemmi name. When lookup_type reports an ambiguous
-   name, retry with the fully-qualified form. Do not invent APIs.
-6. grep_codebase searches both coot and the gemmi header tree — use it
-   when you need to see a usage pattern.
-7. Link target: test.cc (+ function.cc if present) against -lgemmi_cpp and
-   -lgtest. No MMDB, no clipper, no coot libraries.
-8. When ready to compile, use **write_gemmi_file** to write each file to disk.
-   Write function.cc first (if needed), then function.hh, then test.cc.
-   Compilation is triggered automatically once function.hh and test.cc are
-   both written — you do not need to call compile_gemmi separately.
-   Alternatively, call compile_gemmi directly to pass all contents at once.
-   If tests FAIL, fix and rewrite the affected file(s) to recompile.
-   Max {MAX_COMPILE_ATTEMPTS} compile attempts total.
-9. **Compile early and often.** Look up at most 3–4 APIs, then call
-   compile_gemmi with your best draft — do not wait until you are certain.
-   Compiler errors are faster feedback than further API research. Once you
-   have reasoned through an API question, do not revisit it; act on your
-   conclusion immediately.
+# Test translation — what you may and may not change
+You MAY rewrite the accessor on the LHS of an assertion when the type changes:
 
-{GEMMI_ANTIPATTERNS}
+    EXPECT_EQ(res->GetSeqNum(), 42);          // MMDB form
+    EXPECT_EQ(res->seqid.num.value, 42);      // gemmi form — same 42
 
-Final output format (ONE response, THREE fenced blocks in this exact order):
+You MAY NOT change the expected value or weaken the comparison operator.
+`42` stays `42`. `EXPECT_EQ` does not become `EXPECT_NEAR`. The original
+expected literals are the correctness oracle.
 
+# Function port
+- Semantics 1:1 — same output for the same input.
+- The function signature must be exactly what test.cc calls. Design them together.
+- function.hh and function.cc must not mention any `mmdb::` name or
+  `<mmdb*>` include. If you typed one, you picked the wrong replacement
+  — look it up. (coot:: and clipper:: are fine.)
+
+# Reuse existing ports — do not re-derive what's already been ported
+Before re-implementing any logic that the original delegates to a
+`coot::` callee, check whether that callee has a verified gemmi port and
+call it instead. A 2-line wrapper around `foo()` should port to a 2-line
+wrapper around `foo_gemmi()` — not a 50-line reimplementation of foo.
+
+- find_gemmi_port — does a verified `_gemmi` port exist for this name?
+                    Pass bare ('cid_to_residue') or qualified. Returns the
+                    target name + absolute header to #include.
+- list_gemmi_ports — list all verified ports (optional substring filter).
+
+Call find_gemmi_port for every `coot::` function the original invokes
+BEFORE writing your body. If a port exists, your body should call it and
+build on it rather than reach for MMDB primitives or gemmi primitives.
+
+# Look up gemmi APIs, do not invent them
+Use these tools BEFORE writing any gemmi name:
+- mmdb_to_gemmi      — authoritative MMDB→gemmi mapping. Try this first.
+- include_for_symbol — canonical #include for a known gemmi/gtest symbol.
+- lookup_type, list_methods, find_header, find_symbol — DB lookups.
+- grep_codebase      — search coot + gemmi headers for a usage pattern.
+
+When lookup_type reports ambiguity, retry with the fully-qualified name.
+
+# Link target
+test.cc (+ function.cc if present) links against -lgemmi_cpp, -lgtest,
+and the coot + clipper libraries. You MAY call into coot:: and clipper::
+helpers where they make the port simpler — only MMDB is off-limits.
+
+# Workflow — write_gemmi_file is the ONLY path
+Build by writing files to disk with **write_gemmi_file**, in this order:
+  1. function.cc (if needed)
+  2. function.hh
+  3. test.cc      ← writing this triggers an automatic compile + run
+
+After an auto-compile, the response shows compile + gtest output. If
+either fails, rewrite the affected file(s) with write_gemmi_file again.
+
+If the compile log ends with "... more lines — use get_compile_errors",
+call get_compile_errors before guessing at the fix.
+
+Max {MAX_COMPILE_ATTEMPTS} compile attempts total.
+
+# Available tools (use ONLY these — do not invent tool names)
+- read_file          — read a C++ source or header file
+- lookup_function    — get source + docs for a function by qualified name
+- lookup_type        — get class/struct definition and method list
+- list_methods       — list all method signatures in a class
+- get_callers        — find functions that call a given function
+- find_header        — resolve a type/function name to its header path
+- resolve_includes   — check which #includes are needed for a code draft
+- search_functions   — find functions by partial name
+- grep_codebase      — text search across coot + gemmi headers
+- get_base_classes   — list base classes of a type
+- find_symbol        — locate a symbol in header files
+- mmdb_to_gemmi      — authoritative MMDB→gemmi method mapping
+- include_for_symbol — canonical #include for a gemmi/gtest symbol
+- find_gemmi_port    — check whether a verified _gemmi port exists
+- list_gemmi_ports   — list all verified gemmi ports
+- write_gemmi_file   — write function.hh / function.cc / test.cc to disk
+- run_gemmi_test     — re-run the last successfully compiled test binary
+- get_compile_errors — return full (untruncated) compiler output
+
+# When to stop looking up and start writing files
+**Hard cap: at most 6 lookup tool calls before your first
+write_gemmi_file.** Lookups include read_file, lookup_type, list_methods,
+find_header, find_symbol, grep_codebase, mmdb_to_gemmi,
+include_for_symbol, find_gemmi_port, list_gemmi_ports. After 6, you MUST
+start writing files even if you
+are uncertain — auto-compile errors are faster and more accurate than
+further research. Re-reading the same file or re-looking-up the same
+symbol counts and is wasted; act on what you already know.
+
+Concretely, start writing as soon as you can name, for each MMDB call
+you replaced: (a) the gemmi header that defines the replacement,
+(b) the receiver type in gemmi, (c) the accessor or free function.
+
+# Terminal condition
+You are done when:
+  1. The latest auto-compile after writing test.cc returned success.
+  2. The gtest output in that response contains "All tests PASSED" (or
+     equivalent — no FAIL lines).
+  3. You have emitted a final response containing the three fenced
+     blocks below in this exact order (omit function.cc if you did not
+     write one).
+
+# Final output format (ONE response)
 ```cpp:function.hh
 ... header contents ...
 ```
 
 ```cpp:function.cc
-... only if needed; otherwise omit this block entirely ...
+... only if you wrote a .cc; otherwise omit this block entirely ...
 ```
 
 ```cpp:test.cc
 ... test contents ...
 ```
 
-If you omit function.cc, just skip the middle block.\
+# Reference: cheat sheet and antipatterns
+{GEMMI_CHEAT_SHEET}
+
+{GEMMI_ANTIPATTERNS}\
 """
 
 _COMPILE_TOOL = {
@@ -461,10 +893,11 @@ _GET_ERRORS_TOOL = {
         "name": "get_compile_errors",
         "description": (
             "Return the FULL last compile log without truncation. "
-            "Call this whenever the compile_gemmi response ends with "
-            "'... (N more lines — use get_compile_errors)' — that footer is a "
-            "signal you are missing context that almost certainly contains the "
-            "real error. Don't try to fix a compile failure from a truncated log."
+            "Call this whenever an auto-compile response (triggered by "
+            "write_gemmi_file test.cc) ends with '... (N more lines — use "
+            "get_compile_errors)' — that footer means you are missing "
+            "context that almost certainly contains the real error. "
+            "Don't try to fix a compile failure from a truncated log."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
@@ -500,10 +933,12 @@ _INCLUDE_FOR_SYMBOL_TOOL = {
     "function": {
         "name": "include_for_symbol",
         "description": (
-            "Return the canonical #include directive that defines a gemmi or "
-            "gtest symbol. Pass natural forms like 'read_pdb_file', "
-            "'gemmi::Vec3', 'TEST', 'EXPECT_EQ'. Use this BEFORE grep_codebase "
-            "when you need a header for a known name."
+            "Return the canonical #include directive that defines a known "
+            "symbol. Works for gemmi/gtest names (e.g. 'read_pdb_file', "
+            "'gemmi::Vec3', 'EXPECT_EQ') and for coot/clipper qualified "
+            "names (e.g. 'coot::molecule_t', 'clipper::Coord_orth'). For "
+            "coot symbols, pass the fully-qualified name. Use this BEFORE "
+            "grep_codebase when you need a header for a known name."
         ),
         "parameters": {
             "type": "object",
@@ -518,16 +953,64 @@ _INCLUDE_FOR_SYMBOL_TOOL = {
     },
 }
 
+_FIND_GEMMI_PORT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "find_gemmi_port",
+        "description": (
+            "Check whether a coot function already has a verified gemmi port "
+            "you can call directly. Pass a bare name ('cid_to_residue') or a "
+            "qualified one ('coot::molecule_t::cid_to_residue'). Returns the "
+            "target `_gemmi` name and the absolute header to #include. Call "
+            "this for ANY coot function the original invokes, BEFORE writing "
+            "the body — if a port exists, call it instead of re-deriving the "
+            "callee's logic with gemmi primitives."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Function name, bare or qualified",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+}
+
+_LIST_GEMMI_PORTS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "list_gemmi_ports",
+        "description": (
+            "List every coot function that already has a verified gemmi "
+            "port. Optionally filter by a case-insensitive substring. Use "
+            "this when you want to scan what's reusable before writing."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "contains": {
+                    "type": "string",
+                    "description": "Optional substring filter (case-insensitive)",
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
 _WRITE_FILE_TOOL = {
     "type": "function",
     "function": {
         "name": "write_gemmi_file",
         "description": (
             "Write one of the three gemmi port files to disk. "
-            "Once both function.hh and test.cc have been written, "
-            "compilation is triggered automatically — you do not need to call "
-            "compile_gemmi separately. Write function.cc first (if needed), "
-            "then function.hh, then test.cc to trigger the build."
+            "Writing test.cc automatically compiles and runs the test — "
+            "this is the ONLY way to compile in this stage. "
+            "Order: function.cc first (if needed), then function.hh, then "
+            "test.cc to trigger the build."
         ),
         "parameters": {
             "type": "object",
@@ -556,8 +1039,9 @@ _GEMMI_BASE_TOOLS = [
 ]
 
 GEMMI_TOOLS = _GEMMI_BASE_TOOLS + [
-    _COMPILE_TOOL, _RUN_TOOL, _GET_ERRORS_TOOL, _WRITE_FILE_TOOL,
+    _RUN_TOOL, _GET_ERRORS_TOOL, _WRITE_FILE_TOOL,
     _MMDB_TO_GEMMI_TOOL, _INCLUDE_FOR_SYMBOL_TOOL,
+    _FIND_GEMMI_PORT_TOOL, _LIST_GEMMI_PORTS_TOOL,
 ]
 
 
@@ -571,6 +1055,66 @@ _FULL_LOG_BYTES = 3000
 _HEAD_LINES     = 50      # large logs: keep this many top lines
 _TAIL_LINES     = 30      # ...and this many bottom lines
 _ERROR_LINES    = 25      # plus this many 'error:' lines from the middle
+
+
+_UNDEF_REF_RE = re.compile(
+    r"undefined reference to `([^']+)'"
+)
+
+
+def _undefined_reference_directive(
+    output: str, function_hh: str, function_cc: str | None,
+) -> str | None:
+    """If the linker error is 'undefined reference to coot::X_gemmi(...)',
+    diagnose whether X is declared-only or just missing a body, and return
+    a directive line for the agent. Returns None if not applicable.
+    """
+    matches = _UNDEF_REF_RE.findall(output)
+    if not matches:
+        return None
+
+    # Only act on the user's target symbol(s) — anything in a coot/clipper
+    # namespace ending in `_gemmi`. Std/gemmi names are real link errors
+    # the model needs to fix differently (wrong library, wrong overload).
+    porter_syms: list[str] = []
+    for m in matches:
+        head = m.split("(", 1)[0].strip()
+        bare = head.rsplit("::", 1)[-1]
+        if "_gemmi" in bare and head.startswith(("coot::", "clipper::")):
+            porter_syms.append(head)
+    if not porter_syms:
+        return None
+
+    target = porter_syms[0]
+    bare = target.rsplit("::", 1)[-1]
+
+    # Decide which fix to suggest. If function.cc wasn't written, the
+    # body is missing entirely. If it was written but the symbol is still
+    # undefined, the signature in .cc doesn't match the .hh declaration.
+    if not function_cc:
+        return (
+            f"DIRECTIVE: linker can't find a body for `{target}`. You wrote "
+            f"a declaration in function.hh but never defined it. Fix by EITHER:\n"
+            f"  (a) adding an inline body to function.hh (best for short ports), OR\n"
+            f"  (b) calling write_gemmi_file with filename=\"function.cc\" "
+            f"containing the definition (signature must match function.hh exactly).\n"
+            f"Then rewrite test.cc unchanged to re-trigger the compile."
+        )
+    if bare not in function_cc:
+        return (
+            f"DIRECTIVE: function.cc was written but does NOT define `{bare}` "
+            f"(the linker can't find it). Check that the signature in "
+            f"function.cc matches function.hh exactly — namespace, name, "
+            f"argument types, and const/ref qualifiers must all match. "
+            f"Rewrite function.cc with write_gemmi_file."
+        )
+    return (
+        f"DIRECTIVE: linker can't resolve `{target}` even though function.cc "
+        f"appears to mention it. The signature in function.cc almost "
+        f"certainly differs from function.hh (a type, const, or ref mismatch "
+        f"counts as a different symbol). Compare the two declarations "
+        f"character-by-character and rewrite function.cc."
+    )
 
 
 def _summarise_compile_output(output: str) -> str:
@@ -632,10 +1176,12 @@ def _make_tool_handlers(
     gemmi_subdir: Path,
     extra_includes: list[Path] | None = None,
     extra_sources: list[Path] | None = None,
+    original_test_cc: str = "",
 ) -> tuple[callable, callable, callable]:
     attempts       = [0]
     last_binary    = [None]
     last_error_log = [None]
+    assertion_warned = [False]
 
     def compile_handler(function_hh: str, test_cc: str,
                         function_cc: str | None = None) -> str:
@@ -657,7 +1203,7 @@ def _make_tool_handlers(
             return (
                 "Include check FAILED (this does not count against your "
                 f"{MAX_COMPILE_ATTEMPTS} compile attempts). Fix the paths "
-                "below and call compile_gemmi again:\n"
+                "below and rewrite the affected file(s) with write_gemmi_file:\n"
                 + "\n\n".join(sections)
             )
 
@@ -679,8 +1225,8 @@ def _make_tool_handlers(
             return (
                 "Gemmi lint FAILED (this does not count against your "
                 f"{MAX_COMPILE_ATTEMPTS} compile attempts). Fix the issues "
-                "below and call compile_gemmi again. These are anti-patterns "
-                "the compiler would also reject:\n\n"
+                "below and rewrite the affected file(s) with write_gemmi_file. "
+                "These are anti-patterns the compiler would also reject:\n\n"
                 + "\n\n".join(lint_sections)
             )
 
@@ -722,18 +1268,25 @@ def _make_tool_handlers(
             run_lines = run_out.splitlines()
             if len(run_lines) > 100:
                 run_out = "\n".join(run_lines[:100]) + f"\n... ({len(run_lines) - 100} more lines)"
-            status = "All tests PASSED." if run_ok else "Some tests FAILED — fix the assertions and recompile."
+            status = "All tests PASSED." if run_ok else "Some tests FAILED — fix your FUNCTION IMPLEMENTATION (do NOT modify the EXPECT_*/ASSERT_* assertions) and recompile."
             return (
                 f"Compilation succeeded (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS}).\n"
                 f"{status}\n{run_out}"
             )
         last_binary[0] = None
         last_error_log[0] = compile_log
-        return f"Compilation FAILED (attempt {attempts[0]}/{MAX_COMPILE_ATTEMPTS}):\n{output}"
+        directive = _undefined_reference_directive(
+            output, function_hh, function_cc,
+        )
+        prefix = (f"Compilation FAILED (attempt {attempts[0]}/"
+                  f"{MAX_COMPILE_ATTEMPTS}):\n")
+        if directive:
+            prefix += directive + "\n\n"
+        return prefix + output
 
     def run_handler() -> str:
         if last_binary[0] is None:
-            return "No compiled binary — call compile_gemmi first."
+            return "No compiled binary — write test.cc with write_gemmi_file first to trigger a build."
         success, output = run_gemmi_test_binary(last_binary[0])
         lines = output.splitlines()
         if len(lines) > 100:
@@ -762,11 +1315,32 @@ def _make_tool_handlers(
                 tc.read_text(),
                 cc.read_text() if cc.exists() else None,
             )
-            return f"'{filename}' written. Compilation triggered automatically:\n\n{result}"
+            # Mid-flight assertion check: surface a missing-RHS warning ONCE
+            # so the agent gets a chance to align literals before finalising.
+            # Subsequent compiles stay silent — semantically equivalent RHS is
+            # accepted, and we don't want to badger the model after one nudge.
+            assertion_warning = ""
+            if original_test_cc and not assertion_warned[0]:
+                violation = _check_assertions_unchanged(
+                    original_test_cc, tc.read_text()
+                )
+                if violation:
+                    assertion_warned[0] = True
+                    assertion_warning = (
+                        "\n\n⚠ ASSERTION CHECK (one-time notice).\n"
+                        + violation
+                    )
+            return (
+                f"'{filename}' written. Compilation triggered automatically:"
+                f"\n\n{result}{assertion_warning}"
+            )
         missing = [f for f in ("function.hh", "test.cc") if not (gemmi_subdir / f).exists()]
         return f"'{filename}' written. Still waiting for: {', '.join(missing)}"
 
-    return compile_handler, run_handler, get_errors_handler, write_file_handler
+    def compiled_ok() -> bool:
+        return last_binary[0] is not None
+
+    return compile_handler, run_handler, get_errors_handler, write_file_handler, compiled_ok
 
 
 _BLOCK_RE = re.compile(
@@ -840,19 +1414,59 @@ def generate_gemmi_port_with_agent(
     """Return ({file_name: contents, ...}, trace_text) or (None, trace) on failure."""
     dep_includes = _dep_extra_includes(conn, function_qname)
     dep_sources  = _dep_extra_sources(conn, function_qname)
-    compile_handler, run_handler, get_errors_handler, write_file_handler = \
-        _make_tool_handlers(gemmi_subdir, dep_includes, dep_sources)
+    compile_handler, run_handler, get_errors_handler, write_file_handler, compiled_ok = \
+        _make_tool_handlers(gemmi_subdir, dep_includes, dep_sources, original_test_cc)
+
+    assertion_dispatch_warned = [False]
 
     def dispatch(name: str, args: dict) -> str:
         if name == "compile_gemmi":
-            return compile_handler(
+            proposed_test_cc = args.get("test_cc", "")
+            prefix = ""
+            if (proposed_test_cc and original_test_cc
+                    and not assertion_dispatch_warned[0]):
+                violation = _check_assertions_unchanged(
+                    original_test_cc, proposed_test_cc
+                )
+                if violation:
+                    assertion_dispatch_warned[0] = True
+                    trace_lines.append(
+                        f"  → [assertion check — one-time notice]\n"
+                        f"{textwrap.indent(violation, '    ')}\n"
+                    )
+                    prefix = (
+                        "⚠ ASSERTION CHECK (one-time notice — compile still "
+                        "proceeded):\n" + violation + "\n\n---\n\n"
+                    )
+            result = compile_handler(
                 args.get("function_hh", ""),
-                args.get("test_cc", ""),
+                proposed_test_cc,
                 args.get("function_cc") or None,
             )
+            return prefix + result
         if name == "write_gemmi_file":
             return write_file_handler(args.get("filename", ""), args.get("contents", ""))
         if name == "run_gemmi_test":
+            if not compiled_ok() and last_draft[0]:
+                draft = last_draft[0]
+                compile_msg = compile_handler(
+                    draft.get("function.hh", ""),
+                    draft.get("test.cc", ""),
+                    draft.get("function.cc") or None,
+                )
+                if not compiled_ok():
+                    return (
+                        "run_gemmi_test: no compiled binary was available, so I "
+                        "auto-compiled the most recent drafts you provided. "
+                        "Compilation failed — fix the errors below and call "
+                        "compile_gemmi with corrected code:\n" + compile_msg
+                    )
+                run_msg = run_handler()
+                return (
+                    "(auto-compiled latest drafts before running — "
+                    f"{compile_msg.splitlines()[0] if compile_msg else 'compile ok'})\n"
+                    + run_msg
+                )
             return run_handler()
         if name == "get_compile_errors":
             return get_errors_handler()
@@ -860,6 +1474,18 @@ def generate_gemmi_port_with_agent(
             return mmdb_to_gemmi(args.get("method", ""))
         if name == "include_for_symbol":
             return include_for_symbol(args.get("symbol", ""))
+        if name == "find_gemmi_port":
+            return _format_ports_for_tool(
+                _find_gemmi_ports(conn, args.get("name", ""))
+            )
+        if name == "list_gemmi_ports":
+            substr = (args.get("contains") or "").lower()
+            ports = _all_gemmi_ports(conn)
+            if substr:
+                ports = [q for q in ports if substr in q.lower()]
+            if not ports:
+                return "No gemmi ports match."
+            return _format_ports_for_tool([_port_entry(q) for q in ports])
         # Widen grep to include the gemmi header tree — most API discovery
         # during a port needs to see gemmi usage, which isn't in PROJECT_ROOT.
         if name == "grep_codebase":
@@ -930,15 +1556,27 @@ def generate_gemmi_port_with_agent(
         if ported:
             lines.append(
                 "**Verified ports — include by ABSOLUTE PATH and call the "
-                "`_gemmi` variant. The build system automatically compiles "
-                "any required dep `.cc` files.**"
+                "real entry point shown below. The signature/namespace is "
+                "parsed from the actual generated header, so use it "
+                "verbatim — do NOT assume the port lives in the same "
+                "namespace or has the same signature as the MMDB original. "
+                "The build system automatically compiles any required dep "
+                "`.cc` files.**"
             )
             for c in ported:
                 hh = OUT_ROOT / sanitize_name(c) / "gemmi" / "function.hh"
-                lines.append(
-                    f"  - `{c}` → `{_gemmi_target_name(c)}`\n"
-                    f'    `#include "{hh}"`'
-                )
+                decls = _parse_gemmi_decls(hh)
+                lines.append(f"  - `{c}`")
+                lines.append(f'    `#include "{hh}"`')
+                if decls:
+                    for d in decls:
+                        lines.append(f"    Call as: `{d['qname']}`")
+                        lines.append(f"      `{d['signature']}`")
+                else:
+                    # Header exists but no `*_gemmi` decl parsed — surface
+                    # the predicted target as a fallback hint.
+                    lines.append(f"    Call as: `{_gemmi_target_name(c)}` "
+                                 "(predicted; verify by reading the header)")
             lines.append("")
         if unported:
             lines.append(
@@ -1071,14 +1709,16 @@ def generate_gemmi_port_with_agent(
                     "Use the answer below; do not re-query.)\n"
                 )
                 trace_lines.append(f"  → [cached × {call_counts[key]}] {name}({json.dumps(hash_args)})")
+                trace_lines.append_call(f"[cached × {call_counts[key]}] {name}({json.dumps(hash_args)})")
                 results.append({"role": "tool", "content": note + cached})
                 continue
             if call_counts[key] > REPEAT_LIMIT and name not in ("compile_gemmi", "run_gemmi_test"):
                 nudge = (
                     f"You have called {name} with these arguments {call_counts[key]} times. "
-                    "Stop repeating — proceed to compile_gemmi with your best drafts."
+                    "Stop repeating — write function.hh and test.cc with write_gemmi_file now to trigger a real compile."
                 )
                 trace_lines.append(f"  → {name}(repeated — nudged)")
+                trace_lines.append_call(f"[repeat-intercept] {name}({json.dumps(hash_args)})")
                 results.append({"role": "tool", "content": nudge})
                 continue
             if verbose:
@@ -1100,10 +1740,10 @@ def generate_gemmi_port_with_agent(
             if len(result_lines) > 150:
                 result_text = ("\n".join(result_lines[:150])
                                + f"\n... ({len(result_lines) - 150} more lines)")
-            trace_lines.append(
-                f"  → {name}({json.dumps(args) if name != 'compile_gemmi' else '{...}'})"
-            )
+            short = json.dumps(args) if name != 'compile_gemmi' else '{...}'
+            trace_lines.append(f"  → {name}({short})")
             trace_lines.append(textwrap.indent(result_text, "      ") + "\n")
+            trace_lines.append_call(f"{name}({short})")
             if name not in NO_CACHE:
                 tool_cache[key] = result_text
             results.append({"role": "tool", "content": result_text})
@@ -1125,6 +1765,7 @@ def generate_gemmi_port_with_agent(
     for turn in range(50):
         print(f"  [gemmi] turn {turn + 1}/50 ...", end="", flush=True)
         data = _chat(messages, model, GEMMI_TOOLS)
+        _log_llm_timing(data, stage="gemmi", turn=turn + 1, verbose=verbose, trace_lines=trace_lines)
         msg  = data.get("message", {})
         tool_calls        = msg.get("tool_calls") or []
         thinking          = msg.get("thinking",  "") or ""
@@ -1302,6 +1943,7 @@ def generate_gemmi_port_with_agent(
         )})
         try:
             data = _chat(messages, model, tools=[])
+            _log_llm_timing(data, stage="gemmi", turn="rescue", verbose=verbose, trace_lines=trace_lines)
             assistant_content = (data.get("message") or {}).get("content") or ""
             trace_lines.append(f"[assistant — rescue]\n{textwrap.indent(assistant_content, '  ')}\n")
             rescued = _extract_blocks(assistant_content)
@@ -1313,6 +1955,21 @@ def generate_gemmi_port_with_agent(
             trace_lines.append(f"[agent] Rescue call failed: {e}\n")
             if _is_usable(last_draft[0]):
                 final_blocks = last_draft[0]
+
+    # Final assertion check: warn if test.cc dropped or weakened an original
+    # RHS literal, but do NOT discard — semantically equivalent expressions
+    # are valid ports and a strict reject loses good work. The warning is
+    # written to the trace so it can be reviewed after the fact.
+    if final_blocks and original_test_cc:
+        violation = _check_assertions_unchanged(
+            original_test_cc, final_blocks.get("test.cc", "")
+        )
+        if violation:
+            trace_lines.append(
+                f"[agent] Final assertion check WARNING (output kept — verify "
+                f"RHS is semantically equivalent).\n"
+                f"{textwrap.indent(violation, '  ')}\n"
+            )
 
     text = trace_lines.text()
     trace_lines.close()

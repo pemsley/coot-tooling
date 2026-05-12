@@ -233,6 +233,53 @@ def get_file_functions(
     return [r[0] for r in rows]
 
 
+def expand_with_callee_deps(
+    conn: sqlite3.Connection,
+    seed_qnames: list[str],
+    mmdb_only: bool = False,
+) -> list[str]:
+    """BFS-expand seed_qnames to include every transitive callee that
+    exists as a function row in the DB (i.e. is portable in-codebase).
+
+    Use this when a target function calls helpers that haven't been ported
+    yet — adding them to the batch and combining with topo ordering means
+    they're converted callees-first, so the target's gemmi port can link
+    against existing gemmi versions of its helpers.
+
+    If `mmdb_only` is True, transitive callees are filtered to those that
+    use at least one mmdb:: type. The original seeds are always retained
+    regardless of the filter.
+    """
+    if not seed_qnames:
+        return []
+    result: set[str] = set(seed_qnames)
+    frontier: list[str] = list(seed_qnames)
+    while frontier:
+        placeholders = ",".join("?" * len(frontier))
+        if mmdb_only:
+            rows = conn.execute(f"""
+                SELECT DISTINCT c.callee_qualified_name
+                FROM calls c
+                JOIN functions caller ON caller.id = c.caller_id
+                JOIN functions callee ON callee.qualified_name = c.callee_qualified_name
+                JOIN uses_type u ON u.function_id = callee.id
+                WHERE caller.qualified_name IN ({placeholders})
+                  AND u.type_qualified_name LIKE 'mmdb::%'
+            """, frontier).fetchall()
+        else:
+            rows = conn.execute(f"""
+                SELECT DISTINCT c.callee_qualified_name
+                FROM calls c
+                JOIN functions caller ON caller.id = c.caller_id
+                JOIN functions callee ON callee.qualified_name = c.callee_qualified_name
+                WHERE caller.qualified_name IN ({placeholders})
+            """, frontier).fetchall()
+        new = [r[0] for r in rows if r[0] not in result]
+        result.update(new)
+        frontier = new
+    return sorted(result)
+
+
 def get_internal_call_deps(
     conn: sqlite3.Connection, qnames: list[str],
 ) -> dict[str, set[str]]:
