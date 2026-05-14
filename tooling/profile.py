@@ -249,18 +249,18 @@ def plot_graph(results: list[FunctionResult], stages: list[str], out_path: str |
     statuses = ["pass", "fail", "missing"]
     status_colors = [PASS, FAIL, MISS]
 
-    fig = plt.figure(figsize=(18, 6))
+    fig = plt.figure(figsize=(16, 11))
     fig.patch.set_facecolor(BG)
 
     # Title + subtitle
-    fig.text(0.5, 0.97, "MMDB → Gemmi Refactor", ha="center", va="top",
+    fig.text(0.5, 0.98, "MMDB → Gemmi Refactor", ha="center", va="top",
              fontsize=17, fontweight="bold", color=TEXT)
-    fig.text(0.5, 0.91, f"{total} functions attempted  ·  {total_mmdb} total MMDB functions in DB",
+    fig.text(0.5, 0.94, f"{total} functions attempted  ·  {total_mmdb} total MMDB functions in DB",
              ha="center", va="top", fontsize=10, color=SUBTEXT)
 
-    gs = fig.add_gridspec(1, 3, left=0.05, right=0.97, top=0.82, bottom=0.14,
-                          wspace=0.38)
-    axes = [fig.add_subplot(gs[i]) for i in range(3)]
+    gs = fig.add_gridspec(2, 2, left=0.07, right=0.97, top=0.88, bottom=0.08,
+                          wspace=0.38, hspace=0.48)
+    axes = [fig.add_subplot(gs[i // 2, i % 2]) for i in range(4)]
 
     def _style_ax(ax, title, xlabel=None, ylabel=None):
         ax.set_facecolor(PANEL_BG)
@@ -313,7 +313,7 @@ def plot_graph(results: list[FunctionResult], stages: list[str], out_path: str |
 
     # ── Panel 2: pass-rate funnel (of attempted) ──────────────────────────────
     ax2 = axes[1]
-    _style_ax(ax2, "Pass rate", xlabel="% of attempted")
+    _style_ax(ax2, "Pass rate (of all attempted)", xlabel="% of attempted")
     labels = [s.capitalize() for s in stages]
     pass_counts = [stage_data[s][0] for s in stages]
     pcts = [100 * p / total if total else 0 for p in pass_counts]
@@ -375,6 +375,46 @@ def plot_graph(results: list[FunctionResult], stages: list[str], out_path: str |
     ax3.set_axisbelow(True)
     ax3.spines["left"].set_visible(False)
     ax3.tick_params(left=False)
+
+    # ── Panel 4: conditional pass rate (vs previous stage) ───────────────────
+    ax4 = axes[3]
+    if all(s in stage_data for s in STAGES):
+        _style_ax(ax4, "Conditional pass rate", xlabel="% of prior-stage passes")
+
+        # Denominators: oracle uses total attempted; test uses oracle passes; gemmi uses test passes
+        prior_pass = [total, stage_data["oracle"][0], stage_data["test"][0]]
+        cond_pass_counts = [stage_data[s][0] for s in STAGES]
+        cond_pcts = [
+            100 * p / denom if denom else 0
+            for p, denom in zip(cond_pass_counts, prior_pass)
+        ]
+        denom_labels = [f"{p}/{d}" for p, d in zip(cond_pass_counts, prior_pass)]
+        y4 = np.arange(len(STAGES))
+
+        ax4.barh(y4, [100] * len(STAGES), height=bar_h, color=MISS, zorder=2, linewidth=0)
+        ax4.barh(y4, cond_pcts, height=bar_h, color=PASS, zorder=3, linewidth=0)
+
+        for i, (pct, label) in enumerate(zip(cond_pcts, denom_labels)):
+            if pct >= 12:
+                ax4.text(pct - 1.5, i, f"{pct:.1f}%",
+                         va="center", ha="right", fontsize=9,
+                         fontweight="bold", color="white", zorder=4)
+            else:
+                ax4.text(pct + 1.5, i, f"{pct:.1f}%",
+                         va="center", ha="left", fontsize=9,
+                         fontweight="bold", color=SUBTEXT, zorder=4)
+            ax4.text(102, i, label, va="center", ha="left", fontsize=8, color=SUBTEXT)
+
+        ax4.set_yticks(y4)
+        ax4.set_yticklabels([s.capitalize() for s in STAGES], fontsize=10)
+        ax4.set_xlim(0, 125)
+        ax4.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{int(v)}%"))
+        ax4.xaxis.grid(True, color=GRID, linewidth=0.8, zorder=0)
+        ax4.set_axisbelow(True)
+        ax4.spines["left"].set_visible(False)
+        ax4.tick_params(left=False)
+    else:
+        ax4.set_visible(False)
 
     # ── Footer: legend for panel 3 (left) + timestamp (right) ────────────────
     legend_handles = [
