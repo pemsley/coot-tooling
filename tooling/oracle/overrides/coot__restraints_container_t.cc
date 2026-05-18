@@ -6,55 +6,34 @@
 //   - fills fixed_atom_indices
 // Do NOT set udd_atom_index_handle or other private fields manually —
 // they are populated as a side-effect of construction.
-mmdb::Manager *mol = new mmdb::Manager();
-mol->ReadCoorFile("@PDB_PATH@");
 
-std::vector<std::pair<bool, mmdb::Residue *>> residues_vec;
-int nModels = mol->GetNumberOfModels();
-for (int imod = 1; imod <= nModels; imod++) {
-   mmdb::Model *model_p = mol->GetModel(imod);
-   if (!model_p) continue;
-   int nChains = model_p->GetNumberOfChains();
-   for (int ich = 0; ich < nChains; ich++) {
-      mmdb::Chain *chain_p = model_p->GetChain(ich);
-      if (!chain_p) continue;
-      int nRes = chain_p->GetNumberOfResidues();
-      for (int ires = 0; ires < nRes; ires++) {
-         mmdb::Residue *residue_p = chain_p->GetResidue(ires);
-         if (residue_p)
-            residues_vec.push_back({false, residue_p});
-      }
-   }
-}
+```cpp
+molecules_container_t mc;
+int imol     = mc.read_pdb("@PDB_PATH@");
 
-std::vector<mmdb::Link> links;
-std::vector<coot::atom_spec_t> fixed_atom_specs;
-clipper::Xmap<float> xmap;
+mmdb::Manager *mol = mc.get_mol(imol);
 
-coot::protein_geometry geom;
-geom.init_standard();
+coot::protein_geometry pg;
+pg.init_standard();
 
-coot::restraints_container_t restraints(
-   residues_vec, links, geom, mol, fixed_atom_specs, &xmap);
+clipper::Xmap<float> dummy_xmap;
 
-// thread_pool must be set before make_restraints — without it the call
-// returns 0 restraints and restraints_vec stays empty.
-int n_threads = 4;
-ctpl::thread_pool tp(n_threads);
-restraints.thread_pool(&tp, n_threads);
+std::vector<std::pair<bool,mmdb::Residue *> > residues;
+residues.push_back(std::pair<bool,mmdb::Residue *>(false, residue_p));
 
-// Populate restraints_vec so atoms have bonds/angles/planes applied.
-// imol=0 is a placeholder (only used for rotamer lookups).
-int imol = 0;
-restraints.make_restraints(imol, geom,
-   coot::TYPICAL_RESTRAINTS,
-   /*do_residue_internal_torsions=*/false,
-   /*do_trans_peptide_restraints=*/true,
-   /*rama_plot_target_weight=*/1.0,
-   /*do_rama_plot_restraints=*/false,
-   /*do_auto_helix_restraints=*/false,
-   /*do_auto_strand_restraints=*/false,
-   /*do_auto_h_bond_restraints=*/false,
-   coot::NO_PSEUDO_BONDS);
+coot::restraints_container_t restraints(residues, {}, pg, mol, {},  &dummy_xmap);
 
-// restraints is now fully set up — call the target function on it directly.
+// restraint_usage_Flags flags = coot::BONDS_ANGLES_PLANES_NON_BONDED_AND_CHIRALS;
+coot::restraint_usage_Flags flags = coot::BONDS_ANGLES_TORSIONS_PLANES_NON_BONDED_AND_CHIRALS;
+coot::pseudo_restraint_bond_type pseudos = coot::NO_PSEUDO_BONDS;
+bool do_internal_torsions = true;
+bool do_trans_peptide_restraints = true;
+
+int n_threads = 1;
+
+ctpl::thread_pool thread_pool(n_threads);
+restraints.thread_pool(&thread_pool, n_threads);
+
+restraints.make_restraints(imol, pg, flags, do_internal_torsions,
+                           do_trans_peptide_restraints, 0, true, false, false, true, pseudos);
+```

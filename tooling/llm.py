@@ -188,6 +188,60 @@ def get_openai_host() -> str | None:
     return OPENAI_HOSTS[0] if OPENAI_HOSTS else None
 
 
+# ── XML tool-call fallback parser ─────────────────────────────────────────────
+
+def _extract_xml_tool_calls(content: str) -> tuple[str, list[dict]]:
+    """Parse XML-style tool calls that some models emit instead of structured calls.
+
+    Handles two formats:
+      1. Hermes/attribute style: <tool_call><function=name><parameter=key>val</parameter></function></tool_call>
+      2. JSON style:             <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+
+    Returns (cleaned_content, tool_calls) where cleaned_content has the XML blocks removed.
+    """
+    import re as _re
+
+    tool_calls: list[dict] = []
+    block_re = _re.compile(r"<tool_call>(.*?)</tool_call>", _re.DOTALL)
+
+    for m in block_re.finditer(content):
+        block = m.group(1).strip()
+
+        # Format 2: JSON body
+        if block.startswith("{"):
+            try:
+                obj = json.loads(block)
+                name = obj.get("name") or obj.get("function")
+                args = obj.get("arguments") or obj.get("parameters") or {}
+                if name:
+                    tool_calls.append({
+                        "type": "function",
+                        "function": {
+                            "name": str(name),
+                            "arguments": json.dumps(args) if isinstance(args, dict) else str(args),
+                        },
+                    })
+                    continue
+            except json.JSONDecodeError:
+                pass
+
+        # Format 1: <function=NAME>...<parameter=KEY>VAL</parameter>...</function>
+        func_m = _re.search(r"<function=([^>]+)>(.*?)</function>", block, _re.DOTALL)
+        if func_m:
+            func_name = func_m.group(1).strip()
+            body = func_m.group(2)
+            params: dict[str, str] = {}
+            for p in _re.finditer(r"<parameter=([^>]+)>(.*?)</parameter>", body, _re.DOTALL):
+                params[p.group(1).strip()] = p.group(2).strip()
+            tool_calls.append({
+                "type": "function",
+                "function": {"name": func_name, "arguments": json.dumps(params)},
+            })
+
+    cleaned = block_re.sub("", content).strip()
+    return cleaned, tool_calls
+
+
 # ── Backend Protocol ───────────────────────────────────────────────────────────
 
 class Backend(Protocol):
@@ -285,6 +339,13 @@ class OllamaBackend:
                 resp.close()
             except Exception:
                 pass
+
+        # Fallback: model emitted XML-style tool calls in content instead of
+        # using Ollama's structured tool_calls field.
+        if not accumulated_tool_calls and "<tool_call>" in accumulated_content:
+            accumulated_content, accumulated_tool_calls = _extract_xml_tool_calls(
+                accumulated_content
+            )
 
         return {
             "message": {
@@ -452,6 +513,12 @@ class OpenAIBackend:
                 accumulated_content = _re.sub(
                     r"<think>.*?</think>", "", accumulated_content, flags=_re.DOTALL
                 ).strip()
+
+        # Fallback: model emitted XML-style tool calls in content.
+        if not final_tool_calls and "<tool_call>" in accumulated_content:
+            accumulated_content, final_tool_calls = _extract_xml_tool_calls(
+                accumulated_content
+            )
 
         return {
             "message": {

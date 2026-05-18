@@ -31,11 +31,13 @@ def generate_gemmi(
     verbose: bool = False,
     conn: sqlite3.Connection | None = None,
     commit: bool = False,
+    sig_hash: str | None = None,
 ) -> Path:
     """Emit oracle_dir/gemmi/{function.hh, [function.cc], test.cc}.
 
     Requires oracle_dir/test/test.cc to exist (the MMDB test whose
-    assertions are carried over unchanged).
+    assertions are carried over unchanged). `sig_hash` pins which overload
+    of `function_qname` is being ported.
     """
     from .agent import generate_gemmi_port_with_agent
 
@@ -49,7 +51,7 @@ def generate_gemmi(
     gemmi_subdir = oracle_dir / "gemmi"
     _conn = conn or connect()
     try:
-        row = get_function(_conn, function_qname)
+        row = get_function(_conn, function_qname, sig_hash)
         if row is None or not row["source_code"]:
             raise RuntimeError(
                 f"No source found in code_graph.db for {function_qname}"
@@ -125,7 +127,10 @@ def generate_gemmi(
         print(f"[gemmi] Committing port for {function_qname}...")
         _commit_conn = conn or connect()
         try:
-            commit_gemmi_port(_commit_conn, function_qname, oracle_dir / "gemmi")
+            commit_gemmi_port(
+                _commit_conn, function_qname, oracle_dir / "gemmi",
+                sig_hash=sig_hash,
+            )
         except Exception as e:
             print(f"[gemmi] Warning: git commit failed — {e}")
         finally:

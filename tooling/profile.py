@@ -209,7 +209,8 @@ def db_coverage(results: list[FunctionResult]) -> dict:
     }
 
 
-def plot_graph(results: list[FunctionResult], stages: list[str], out_path: str | None) -> None:
+def plot_graph(results: list[FunctionResult], stages: list[str], out_path: str | None,
+               presentation: bool = False) -> None:
     import datetime
     import matplotlib
     if out_path:
@@ -220,15 +221,23 @@ def plot_graph(results: list[FunctionResult], stages: list[str], out_path: str |
     import numpy as np
 
     # ── Palette & style ────────────────────────────────────────────────────────
-    BG       = "#F7F8FA"
-    PANEL_BG = "#FFFFFF"
+    if presentation:
+        BG       = "none"
+        PANEL_BG = "none"
+        TEXT     = "#1A1A2E"
+        SUBTEXT  = "#4B5563"
+        GRID     = "#D1D5DB"
+    else:
+        BG       = "#F7F8FA"
+        PANEL_BG = "#FFFFFF"
+        TEXT     = "#1A1A2E"
+        SUBTEXT  = "#6B7280"
+        GRID     = "#E5E7EB"
+
     PASS     = "#3ECF8E"   # teal-green
     FAIL     = "#F06464"   # soft red
     MISS     = "#D8DCE6"   # cool grey
     ATT      = "#6EA8FE"   # periwinkle blue
-    TEXT     = "#1A1A2E"
-    SUBTEXT  = "#6B7280"
-    GRID     = "#E5E7EB"
 
     plt.rcParams.update({
         "font.family":       "sans-serif",
@@ -246,21 +255,18 @@ def plot_graph(results: list[FunctionResult], stages: list[str], out_path: str |
     cov = db_coverage(results)
     total_mmdb = cov["total_mmdb"]
     stage_data = {s: _stage_counts(results, s) for s in stages}
-    statuses = ["pass", "fail", "missing"]
-    status_colors = [PASS, FAIL, MISS]
-
-    fig = plt.figure(figsize=(16, 11))
+    fig = plt.figure(figsize=(22, 6))
     fig.patch.set_facecolor(BG)
 
     # Title + subtitle
     fig.text(0.5, 0.98, "MMDB → Gemmi Refactor", ha="center", va="top",
              fontsize=17, fontweight="bold", color=TEXT)
-    fig.text(0.5, 0.94, f"{total} functions attempted  ·  {total_mmdb} total MMDB functions in DB",
+    fig.text(0.5, 0.93, f"{total} functions attempted  ·  {total_mmdb} total MMDB functions in DB",
              ha="center", va="top", fontsize=10, color=SUBTEXT)
 
-    gs = fig.add_gridspec(2, 2, left=0.07, right=0.97, top=0.88, bottom=0.08,
-                          wspace=0.38, hspace=0.48)
-    axes = [fig.add_subplot(gs[i // 2, i % 2]) for i in range(4)]
+    gs = fig.add_gridspec(1, 3, left=0.06, right=0.97, top=0.84, bottom=0.12,
+                          wspace=0.42)
+    axes = [fig.add_subplot(gs[0, i]) for i in range(3)]
 
     def _style_ax(ax, title, xlabel=None, ylabel=None):
         ax.set_facecolor(PANEL_BG)
@@ -276,43 +282,8 @@ def plot_graph(results: list[FunctionResult], stages: list[str], out_path: str |
             ax.set_ylabel(ylabel, fontsize=9, color=SUBTEXT, labelpad=6)
         ax.tick_params(labelsize=9)
 
-    # ── Panel 1: stacked bar by stage ─────────────────────────────────────────
-    ax = axes[0]
-    _style_ax(ax, "Stage breakdown", ylabel="Functions")
-    x = np.arange(len(stages))
-    bar_w = 0.52
-    bottoms = np.zeros(len(stages))
-    for status, color in zip(statuses, status_colors):
-        vals = np.array([stage_data[s][statuses.index(status)] for s in stages], dtype=float)
-        bars = ax.bar(x, vals, bottom=bottoms, color=color, width=bar_w,
-                      zorder=3, linewidth=0)
-        for rect, v in zip(bars, vals):
-            if v < 1:
-                bottoms += vals
-                continue
-            label_color = "white" if status in ("pass", "fail") else "#888"
-            ax.text(rect.get_x() + rect.get_width() / 2,
-                    rect.get_y() + rect.get_height() / 2,
-                    str(int(v)),
-                    ha="center", va="center", fontsize=9,
-                    fontweight="bold", color=label_color, zorder=4)
-        bottoms += vals
-
-    ax.set_xticks(x)
-    ax.set_xticklabels([s.capitalize() for s in stages], fontsize=10)
-    ax.set_ylim(0, total * 1.18)
-    ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True, nbins=5))
-    ax.yaxis.grid(True, color=GRID, linewidth=0.8, zorder=0)
-    ax.set_axisbelow(True)
-    ax.legend(
-        handles=[mpatches.Patch(color=c, label=s.capitalize())
-                 for s, c in zip(statuses, status_colors)],
-        fontsize=8, frameon=False, loc="upper right",
-        labelcolor=SUBTEXT,
-    )
-
-    # ── Panel 2: pass-rate funnel (of attempted) ──────────────────────────────
-    ax2 = axes[1]
+    # ── Panel 1: pass-rate funnel (of attempted) ──────────────────────────────
+    ax2 = axes[0]
     _style_ax(ax2, "Pass rate (of all attempted)", xlabel="% of attempted")
     labels = [s.capitalize() for s in stages]
     pass_counts = [stage_data[s][0] for s in stages]
@@ -341,7 +312,7 @@ def plot_graph(results: list[FunctionResult], stages: list[str], out_path: str |
     ax2.spines["left"].set_visible(False)
     ax2.tick_params(left=False)
 
-    # ── Panel 3: DB coverage ──────────────────────────────────────────────────
+    # ── Panel 2: DB coverage ──────────────────────────────────────────────────
     ax3 = axes[2]
     _style_ax(ax3, "DB coverage", xlabel=f"% of {total_mmdb} MMDB functions")
     cov_labels = ["Attempted"] + [s.capitalize() for s in stages]
@@ -369,15 +340,15 @@ def plot_graph(results: list[FunctionResult], stages: list[str], out_path: str |
 
     ax3.set_yticks(y3)
     ax3.set_yticklabels(cov_labels, fontsize=10)
-    ax3.set_xlim(0, 125)
+    ax3.set_xlim(0, 119)
     ax3.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{int(v)}%"))
     ax3.xaxis.grid(True, color=GRID, linewidth=0.8, zorder=0)
     ax3.set_axisbelow(True)
     ax3.spines["left"].set_visible(False)
     ax3.tick_params(left=False)
 
-    # ── Panel 4: conditional pass rate (vs previous stage) ───────────────────
-    ax4 = axes[3]
+    # ── Panel 3: conditional pass rate (vs previous stage) ───────────────────
+    ax4 = axes[1]
     if all(s in stage_data for s in STAGES):
         _style_ax(ax4, "Conditional pass rate", xlabel="% of prior-stage passes")
 
@@ -407,7 +378,7 @@ def plot_graph(results: list[FunctionResult], stages: list[str], out_path: str |
 
         ax4.set_yticks(y4)
         ax4.set_yticklabels([s.capitalize() for s in STAGES], fontsize=10)
-        ax4.set_xlim(0, 125)
+        ax4.set_xlim(0, 119)
         ax4.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{int(v)}%"))
         ax4.xaxis.grid(True, color=GRID, linewidth=0.8, zorder=0)
         ax4.set_axisbelow(True)
@@ -436,7 +407,8 @@ def plot_graph(results: list[FunctionResult], stages: list[str], out_path: str |
              fontsize=8, color=SUBTEXT)
 
     if out_path:
-        fig.savefig(out_path, dpi=160, bbox_inches="tight")
+        fig.savefig(out_path, dpi=160, bbox_inches="tight",
+                    transparent=presentation)
         print(f"Graph saved to {out_path}")
     else:
         plt.show()
@@ -463,6 +435,8 @@ def main() -> None:
                         help="show a matplotlib progress chart")
     parser.add_argument("--graph-out", metavar="FILE", default=None,
                         help="save graph to FILE instead of displaying it (implies --graph)")
+    parser.add_argument("--presentation", action="store_true",
+                        help="transparent background and cleaner styling for slides")
     args = parser.parse_args()
 
     stages = [args.stage] if args.stage else list(STAGES)
@@ -477,7 +451,7 @@ def main() -> None:
         write_csv(results, stages, args.csv)
 
     if args.graph or args.graph_out:
-        plot_graph(results, stages, args.graph_out)
+        plot_graph(results, stages, args.graph_out, presentation=args.presentation)
 
 
 if __name__ == "__main__":

@@ -125,7 +125,10 @@ def _install_batch_log(out_root: Path) -> None:
     sys.stderr = _Tee(sys.stderr, log_file)
 
 
-def _run_with_deadline(target, args_tuple, deadline_s: int, qname: str) -> "Result":
+def _run_with_deadline(
+    target, args_tuple, deadline_s: int,
+    qname: str, sig_hash: str | None = None,
+) -> "Result":
     """Run target(*args_tuple) on a daemon thread; abandon it if it overruns.
 
     On overrun the orphan thread is left running (Python can't kill threads),
@@ -140,7 +143,8 @@ def _run_with_deadline(target, args_tuple, deadline_s: int, qname: str) -> "Resu
         except BaseException as e:  # noqa: BLE001 — record any failure
             box["error"] = e
 
-    t = threading.Thread(target=_runner, name=f"fn:{qname}", daemon=True)
+    label = qname if sig_hash is None else f"{qname}#{sig_hash}"
+    t = threading.Thread(target=_runner, name=f"fn:{label}", daemon=True)
     t.start()
     t.join(deadline_s)
     if t.is_alive():
@@ -148,14 +152,14 @@ def _run_with_deadline(target, args_tuple, deadline_s: int, qname: str) -> "Resu
         # shows it's been abandoned rather than mid-stage.
         with _worker_state_lock:
             _worker_state[t.name] = (qname, "ABANDONED", _worker_state.get(t.name, (qname, "?", 0))[2])
-        r = Result(qname)
+        r = Result(qname, sig_hash)
         r.error = (
             f"wall-clock deadline ({deadline_s}s) exceeded — abandoning "
             "(orphan thread will resolve as bounded subprocesses unwind)"
         )
         return r
     if "error" in box:
-        r = Result(qname)
+        r = Result(qname, sig_hash)
         r.error = f"unhandled exception: {box['error']}"
         return r
     return box["result"]
@@ -180,8 +184,9 @@ from .llm import OPENAI_HOSTS, set_openai_host
 # ── result tracking ───────────────────────────────────────────────────────────
 
 class Result:
-    def __init__(self, qname: str):
+    def __init__(self, qname: str, sig_hash: str | None = None):
         self.qname      = qname
+        self.sig_hash   = sig_hash
         self.skipped    = False
         self.oracle_ok: bool | None = None
         self.test_ok:   bool | None = None
@@ -190,7 +195,12 @@ class Result:
 
     @property
     def short(self) -> str:
-        return self.qname.rsplit("::", 1)[-1]
+        base = self.qname.rsplit("::", 1)[-1]
+        return f"{base}#{self.sig_hash}" if self.sig_hash else base
+
+    @property
+    def entry(self) -> tuple[str, str | None]:
+        return (self.qname, self.sig_hash)
 
 
 # ── dependency ordering ───────────────────────────────────────────────────────
@@ -398,6 +408,7 @@ def _test_is_passing(out_dir: Path) -> bool:
 
 def _process(
     qname: str,
+    sig_hash: str | None,
     model: str,
     agent: bool,
     verbose: bool,
@@ -407,8 +418,8 @@ def _process(
     overwrite: bool = False,
     commit: bool = False,
 ) -> Result:
-    r = Result(qname)
-    out_dir = OUT_ROOT / sanitize_name(qname)
+    r = Result(qname, sig_hash)
+    out_dir = OUT_ROOT / sanitize_name(qname, sig_hash)
     oracle_cc = out_dir / "oracle" / "oracle.cc"
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -455,7 +466,8 @@ def _process(
         conn = connect()
         try:
             result_dir = generate_one(
-                conn, qname, model=model, verbose=verbose,
+                conn, qname, sig_hash=sig_hash,
+                model=model, verbose=verbose,
             )
         except urllib.error.URLError as e:
             log(f"oracle: FAILED — Ollama unreachable: {e}")
@@ -498,7 +510,8 @@ def _process(
         log("gemmi: generating ...")
         _set_worker_state(qname, "gemmi")
         try:
-            generate_gemmi(out_dir, qname, model=model, verbose=verbose, commit=commit)
+            generate_gemmi(out_dir, qname, model=model, verbose=verbose,
+                           commit=commit, sig_hash=sig_hash)
             log("gemmi: ok")
             r.gemmi_ok = True
         except Exception as e:
@@ -513,8 +526,10 @@ def _process(
 
 # ── parallel scheduling ───────────────────────────────────────────────────────
 
-def _run_in_parallel(qnames: list[str], args, *, label: str = "") -> list[Result]:
-    """Submit every qname to a thread pool and collect Results.
+def _run_in_parallel(
+    entries: list[tuple[str, str | None]], args, *, label: str = "",
+) -> list[Result]:
+    """Submit every (qname, sig_hash) entry to a thread pool and collect Results.
 
     Use for one wave of a topo schedule, or for the whole batch when
     --no-topo is set. Results return in completion order, not submission
@@ -544,7 +559,8 @@ def _run_in_parallel(qnames: list[str], args, *, label: str = "") -> list[Result
     for h in openai_hosts:
         openai_host_queue.put(h)
 
-    def _process_with_host(qname: str) -> Result:
+    def _process_with_host(entry: tuple[str, str | None]) -> Result:
+        qname, sig_hash = entry
         ollama_host = ollama_host_queue.get()
         openai_host = None
         try:
@@ -554,11 +570,11 @@ def _run_in_parallel(qnames: list[str], args, *, label: str = "") -> list[Result
                 set_openai_host(openai_host)
             return _run_with_deadline(
                 _process,
-                (qname, args.model, args.agent, args.verbose,
+                (qname, sig_hash, args.model, args.agent, args.verbose,
                  args.skip_oracle, args.skip_existing,
                  with_gemmi, args.overwrite, commit),
                 FUNCTION_DEADLINE_SECONDS,
-                qname,
+                qname, sig_hash,
             )
         finally:
             ollama_host_queue.put(ollama_host)
@@ -568,9 +584,9 @@ def _run_in_parallel(qnames: list[str], args, *, label: str = "") -> list[Result
     out: list[Result] = []
     futures = {}
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        for qname in qnames:
-            f = pool.submit(_process_with_host, qname)
-            futures[f] = qname
+        for entry in entries:
+            f = pool.submit(_process_with_host, entry)
+            futures[f] = entry
         for f in as_completed(futures):
             r = f.result()
             out.append(r)
@@ -580,8 +596,10 @@ def _run_in_parallel(qnames: list[str], args, *, label: str = "") -> list[Result
     return out
 
 
-def _run_topo_waves(qnames: list[str], args) -> list[Result]:
-    """Process qnames respecting call-graph deps with a single shared pool.
+def _run_topo_waves(
+    entries: list[tuple[str, str | None]], args,
+) -> list[Result]:
+    """Process entries respecting call-graph deps with a single shared pool.
 
     A task is submitted as soon as all its in-batch deps have completed,
     rather than waiting for an entire wave barrier. This keeps both workers
@@ -589,7 +607,7 @@ def _run_topo_waves(qnames: list[str], args) -> list[Result]:
     """
     conn = connect()
     try:
-        deps = get_internal_call_deps(conn, qnames)
+        deps = get_internal_call_deps(conn, entries)
     finally:
         conn.close()
 
@@ -615,7 +633,8 @@ def _run_topo_waves(qnames: list[str], args) -> list[Result]:
     for h in openai_hosts:
         openai_host_queue.put(h)
 
-    def _process_with_host(qname: str) -> Result:
+    def _process_with_host(entry: tuple[str, str | None]) -> Result:
+        qname, sig_hash = entry
         ollama_host = ollama_host_queue.get()
         openai_host = None
         try:
@@ -625,84 +644,102 @@ def _run_topo_waves(qnames: list[str], args) -> list[Result]:
                 set_openai_host(openai_host)
             return _run_with_deadline(
                 _process,
-                (qname, args.model, args.agent, args.verbose,
+                (qname, sig_hash, args.model, args.agent, args.verbose,
                  args.skip_oracle, args.skip_existing,
                  with_gemmi, args.overwrite, commit),
                 FUNCTION_DEADLINE_SECONDS,
-                qname,
+                qname, sig_hash,
             )
         finally:
             ollama_host_queue.put(ollama_host)
             if openai_host is not None:
                 openai_host_queue.put(openai_host)
 
-    # pending[q] = set of in-batch deps not yet completed
-    pending: dict[str, set[str]] = {q: set(deps.get(q, set())) for q in qnames}
-    in_flight: dict[object, str] = {}  # future -> qname
+    # pending[entry] = set of in-batch deps (also entries) not yet completed
+    pending: dict[tuple[str, str | None], set[tuple[str, str | None]]] = {
+        e: set(deps.get(e, set())) for e in entries
+    }
+    in_flight: dict[object, tuple[str, str | None]] = {}
     results: list[Result] = []
 
     def _submit_ready(pool) -> None:
-        for q in list(pending):
-            if not pending[q]:
-                f = pool.submit(_process_with_host, q)
-                in_flight[f] = q
-                del pending[q]
+        for e in list(pending):
+            if not pending[e]:
+                f = pool.submit(_process_with_host, e)
+                in_flight[f] = e
+                del pending[e]
 
-    print(f"Dep-parallel schedule: {len(qnames)} qname(s), {len(deps)} with in-batch deps")
+    dep_count = sum(1 for v in deps.values() if v)
+    print(f"Dep-parallel schedule: {len(entries)} entry(ies), {dep_count} with in-batch deps")
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         _submit_ready(pool)
         while in_flight:
             done = next(as_completed(in_flight))
-            qname = in_flight.pop(done)
+            entry = in_flight.pop(done)
             r = done.result()
             results.append(r)
             status = "skipped" if r.skipped else ("ok" if not r.error else "FAILED")
             print(f"  {r.short}: {status}", flush=True)
             # unlock any tasks that were waiting on this one
             for p in pending.values():
-                p.discard(qname)
+                p.discard(entry)
             _submit_ready(pool)
 
     return results
 
 
-def _print_dry_run(qnames: list[str], seeds: set[str], workers: int) -> None:
+def _entry_label(entry: tuple[str, str | None]) -> str:
+    qname, sig_hash = entry
+    return qname if sig_hash is None else f"{qname} [{sig_hash}]"
+
+
+def _entry_short(entry: tuple[str, str | None]) -> str:
+    qname, sig_hash = entry
+    base = qname.rsplit("::", 1)[-1]
+    return f"{base}#{sig_hash}" if sig_hash else base
+
+
+def _print_dry_run(
+    entries: list[tuple[str, str | None]],
+    seeds: set[tuple[str, str | None]],
+    workers: int,
+) -> None:
     """Print the resolved batch: order, in-batch call deps, and which
     entries are seeds vs. dep-expansions. Mirrors how the scheduler will
     actually process them."""
     conn = connect()
     try:
-        deps = get_internal_call_deps(conn, qnames)
+        deps = get_internal_call_deps(conn, entries)
     finally:
         conn.close()
 
     if workers == 1:
         order = topo_order(deps)
-        print(f"\nProcessing order ({len(order)} method(s), bottom-up; "
+        print(f"\nProcessing order ({len(order)} entry(ies), bottom-up; "
               f"★ = seed, · = pulled in by --with-deps):")
-        for i, q in enumerate(order, 1):
-            marker = "★" if q in seeds else "·"
-            callees = sorted(deps.get(q, set()))
+        for i, e in enumerate(order, 1):
+            marker = "★" if e in seeds else "·"
+            callees = sorted(deps.get(e, set()))
             if callees:
-                short_callees = ", ".join(c.rsplit("::", 1)[-1] for c in callees)
-                print(f"  {i:>3}. {marker} {q}")
+                short_callees = ", ".join(_entry_short(c) for c in callees)
+                print(f"  {i:>3}. {marker} {_entry_label(e)}")
                 print(f"       └─ calls (in-batch): {short_callees}")
             else:
-                print(f"  {i:>3}. {marker} {q}")
+                print(f"  {i:>3}. {marker} {_entry_label(e)}")
     else:
         waves = topo_waves(deps)
-        print(f"\nParallel wave schedule ({len(qnames)} method(s) in "
+        print(f"\nParallel wave schedule ({len(entries)} entry(ies) in "
               f"{len(waves)} wave(s), {workers} worker(s); ★ = seed):")
         for w_idx, wave in enumerate(waves, 1):
-            print(f"  wave {w_idx} ({len(wave)} method(s)):")
-            for q in wave:
-                marker = "★" if q in seeds else "·"
-                callees = sorted(deps.get(q, set()))
+            print(f"  wave {w_idx} ({len(wave)} entry(ies)):")
+            for e in wave:
+                marker = "★" if e in seeds else "·"
+                callees = sorted(deps.get(e, set()))
                 if callees:
-                    short_callees = ", ".join(c.rsplit("::", 1)[-1] for c in callees)
-                    print(f"    {marker} {q}  ← {short_callees}")
+                    short_callees = ", ".join(_entry_short(c) for c in callees)
+                    print(f"    {marker} {_entry_label(e)}  ← {short_callees}")
                 else:
-                    print(f"    {marker} {q}")
+                    print(f"    {marker} {_entry_label(e)}")
 
 
 # ── summary ───────────────────────────────────────────────────────────────────
@@ -718,7 +755,7 @@ def _print_summary(results: list[Result]) -> None:
     print("-" * len(header))
 
     ok = fail = skip = 0
-    for r in sorted(results, key=lambda r: r.qname):
+    for r in sorted(results, key=lambda r: (r.qname, r.sig_hash or "")):
         if r.skipped:
             skip += 1
             print(f"{r.short:<50}  {skip_sym}")
@@ -782,27 +819,27 @@ def main() -> None:
     args = parser.parse_args()
 
     conn = connect()
-    qnames = get_class_functions(conn, args.class_name, mmdb_only=args.mmdb_only)
+    entries = get_class_functions(conn, args.class_name, mmdb_only=args.mmdb_only)
     conn.close()
 
-    if not qnames:
+    if not entries:
         print(f"No methods found for class: {args.class_name}", file=sys.stderr)
         sys.exit(1)
 
     if args.filter:
-        qnames = [q for q in qnames if args.filter in q]
-        if not qnames:
+        entries = [(q, s) for (q, s) in entries if args.filter in q]
+        if not entries:
             print(f"No methods match filter '{args.filter}'", file=sys.stderr)
             sys.exit(1)
 
-    seeds = set(qnames)
+    seeds = set(entries)
     if args.with_deps:
         conn = connect()
         try:
-            qnames = expand_with_callee_deps(conn, qnames, mmdb_only=args.mmdb_only)
+            entries = expand_with_callee_deps(conn, entries, mmdb_only=args.mmdb_only)
         finally:
             conn.close()
-        print(f"--with-deps: {len(seeds)} seed(s) expanded to {len(qnames)} method(s) "
+        print(f"--with-deps: {len(seeds)} seed(s) expanded to {len(entries)} entry(ies) "
               f"(adding transitive callees)")
 
     # Bottom-up topological ordering: callees before callers.
@@ -811,24 +848,24 @@ def main() -> None:
     if not args.no_topo and args.workers == 1:
         conn = connect()
         try:
-            deps = get_internal_call_deps(conn, qnames)
+            deps = get_internal_call_deps(conn, entries)
         finally:
             conn.close()
-        qnames = topo_order(deps)
+        entries = topo_order(deps)
 
     if args.dry_run:
-        _print_dry_run(qnames, seeds, args.workers)
+        _print_dry_run(entries, seeds, args.workers)
         return
 
     if args.list:
-        for q in qnames:
-            print(q)
-        print(f"\n{len(qnames)} methods")
+        for q, s in entries:
+            print(_entry_label((q, s)))
+        print(f"\n{len(entries)} method overload(s)")
         return
 
     _install_batch_log(OUT_ROOT)
     _start_heartbeat()
-    print(f"Processing {len(qnames)} methods from {args.class_name} "
+    print(f"Processing {len(entries)} method(s)/overload(s) from {args.class_name} "
           f"(model={args.model}, backend={args.backend}, workers={args.workers}, agent={args.agent})")
 
     os.environ["CT_BACKEND"] = args.backend
@@ -846,34 +883,36 @@ def main() -> None:
         set_host(hosts[0])
         if openai_hosts:
             set_openai_host(openai_hosts[0])
-        for i, qname in enumerate(qnames, 1):
-            print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]}", flush=True)
+        for i, (qname, sig_hash) in enumerate(entries, 1):
+            print(f"[{i}/{len(entries)}] {_entry_short((qname, sig_hash))}", flush=True)
             r = _run_with_deadline(
                 _process,
-                (qname, args.model, args.agent, args.verbose,
+                (qname, sig_hash, args.model, args.agent, args.verbose,
                  args.skip_oracle, args.skip_existing,
                  args.with_gemmi, args.overwrite, args.commit),
                 FUNCTION_DEADLINE_SECONDS,
-                qname,
+                qname, sig_hash,
             )
             if r.error and "wall-clock deadline" in r.error:
-                print(f"  [{qname.rsplit('::', 1)[-1]}] {r.error}", flush=True)
+                print(f"  [{_entry_short((qname, sig_hash))}] {r.error}", flush=True)
             results.append(r)
     elif args.no_topo:
-        results = _run_in_parallel(qnames, args)
+        results = _run_in_parallel(entries, args)
     else:
-        results = _run_topo_waves(qnames, args)
+        results = _run_topo_waves(entries, args)
 
     _print_summary(results)
     if any(not r.skipped and (not r.oracle_ok or not r.test_ok) for r in results):
         sys.exit(1)
 
 
-def _aggregate(qnames: list[str], source_file: str, with_gemmi: bool) -> None:
+def _aggregate(
+    entries: list[tuple[str, str | None]], source_file: str, with_gemmi: bool,
+) -> None:
     """Print aggregation results; called at the end of main_file."""
     if not with_gemmi:
         return
-    hh, cc = aggregate_gemmi_files(qnames, source_file)
+    hh, cc = aggregate_gemmi_files(entries, source_file)
     print(f"\n[aggregate] {hh}")
     if cc:
         print(f"[aggregate] {cc}")
@@ -915,27 +954,27 @@ def main_file() -> None:
     args = parser.parse_args()
 
     conn = connect()
-    qnames = get_file_functions(conn, args.file, mmdb_only=args.mmdb_only)
+    entries = get_file_functions(conn, args.file, mmdb_only=args.mmdb_only)
     conn.close()
 
-    if not qnames:
+    if not entries:
         print(f"No functions found for file: {args.file}", file=sys.stderr)
         sys.exit(1)
 
     if args.filter:
-        qnames = [q for q in qnames if args.filter in q]
-        if not qnames:
+        entries = [(q, s) for (q, s) in entries if args.filter in q]
+        if not entries:
             print(f"No functions match filter '{args.filter}'", file=sys.stderr)
             sys.exit(1)
 
-    seeds = set(qnames)
+    seeds = set(entries)
     if args.with_deps:
         conn = connect()
         try:
-            qnames = expand_with_callee_deps(conn, qnames, mmdb_only=args.mmdb_only)
+            entries = expand_with_callee_deps(conn, entries, mmdb_only=args.mmdb_only)
         finally:
             conn.close()
-        print(f"--with-deps: {len(seeds)} seed(s) expanded to {len(qnames)} function(s) "
+        print(f"--with-deps: {len(seeds)} seed(s) expanded to {len(entries)} entry(ies) "
               f"(adding transitive callees)")
 
     # Bottom-up topological ordering: callees before callers.
@@ -944,25 +983,25 @@ def main_file() -> None:
     if not args.no_topo and args.workers == 1:
         conn = connect()
         try:
-            deps = get_internal_call_deps(conn, qnames)
+            deps = get_internal_call_deps(conn, entries)
         finally:
             conn.close()
-        qnames = topo_order(deps)
+        entries = topo_order(deps)
 
     if args.dry_run:
-        _print_dry_run(qnames, seeds, args.workers)
+        _print_dry_run(entries, seeds, args.workers)
         return
 
     if args.list:
-        for q in qnames:
-            print(q)
-        print(f"\n{len(qnames)} functions")
+        for q, s in entries:
+            print(_entry_label((q, s)))
+        print(f"\n{len(entries)} function overload(s)")
         return
 
     with_gemmi = not args.no_gemmi
     _install_batch_log(OUT_ROOT)
     _start_heartbeat()
-    print(f"Processing {len(qnames)} functions from {args.file} "
+    print(f"Processing {len(entries)} function(s)/overload(s) from {args.file} "
           f"(model={args.model}, backend={args.backend}, workers={args.workers}, agent={args.agent}, gemmi={with_gemmi})")
 
     os.environ["CT_BACKEND"] = args.backend
@@ -980,26 +1019,26 @@ def main_file() -> None:
         set_host(hosts[0])
         if openai_hosts:
             set_openai_host(openai_hosts[0])
-        for i, qname in enumerate(qnames, 1):
-            print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]}", flush=True)
+        for i, (qname, sig_hash) in enumerate(entries, 1):
+            print(f"[{i}/{len(entries)}] {_entry_short((qname, sig_hash))}", flush=True)
             r = _run_with_deadline(
                 _process,
-                (qname, args.model, args.agent, args.verbose,
+                (qname, sig_hash, args.model, args.agent, args.verbose,
                  args.skip_oracle, args.skip_existing,
                  with_gemmi, args.overwrite, False),
                 FUNCTION_DEADLINE_SECONDS,
-                qname,
+                qname, sig_hash,
             )
             if r.error and "wall-clock deadline" in r.error:
-                print(f"  [{qname.rsplit('::', 1)[-1]}] {r.error}", flush=True)
+                print(f"  [{_entry_short((qname, sig_hash))}] {r.error}", flush=True)
             results.append(r)
     elif args.no_topo:
-        results = _run_in_parallel(qnames, args)
+        results = _run_in_parallel(entries, args)
     else:
-        results = _run_topo_waves(qnames, args)
+        results = _run_topo_waves(entries, args)
 
     _print_summary(results)
-    _aggregate(qnames, args.file, with_gemmi)
+    _aggregate(entries, args.file, with_gemmi)
     if any(not r.skipped and (not r.oracle_ok or not r.test_ok) for r in results):
         sys.exit(1)
 

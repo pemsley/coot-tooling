@@ -18,9 +18,13 @@ COOT_REPO = Path(PROJECT_ROOT)
 AGENT_COAUTHOR = "Co-authored-by: CootAgent <282556670+CootAgent@users.noreply.github.com>"
 
 
-def _source_dir_relative(conn: sqlite3.Connection, function_qname: str) -> Path:
+def _source_dir_relative(
+    conn: sqlite3.Connection,
+    function_qname: str,
+    sig_hash: str | None = None,
+) -> Path:
     """Return the directory of the function's source file, relative to COOT_REPO."""
-    row = get_function(conn, function_qname)
+    row = get_function(conn, function_qname, sig_hash)
     if row is None:
         raise RuntimeError(f"Function not found in DB: {function_qname}")
     abs_path = Path(row["file"])
@@ -37,6 +41,7 @@ def commit_gemmi_port(
     conn: sqlite3.Connection,
     function_qname: str,
     gemmi_subdir: Path,
+    sig_hash: str | None = None,
 ) -> None:
     """Copy port files into the coot repo and create a git commit.
 
@@ -44,11 +49,16 @@ def commit_gemmi_port(
       <coot_repo>/<source_dir>/gemmi/<sanitized_qname>/function.hh
       <coot_repo>/<source_dir>/gemmi/<sanitized_qname>/function.cc   (if present)
       <coot_repo>/<source_dir>/gemmi/<sanitized_qname>/test.cc
+
+    For overloaded functions, pass `sig_hash` so the destination dir is
+    suffixed with `__<hash>` and overloads don't clobber each other.
     """
-    src_rel_dir = _source_dir_relative(conn, function_qname)
+    src_rel_dir = _source_dir_relative(conn, function_qname, sig_hash)
 
     # Sanitise the qualified name the same way the batch runner does.
     sanitized = function_qname.replace("::", "__").replace(" ", "_")
+    if sig_hash:
+        sanitized = f"{sanitized}__{sig_hash}"
     dest_dir = COOT_REPO / src_rel_dir / "gemmi" / sanitized
     dest_dir.mkdir(parents=True, exist_ok=True)
 

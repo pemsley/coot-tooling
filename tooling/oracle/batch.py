@@ -83,6 +83,7 @@ def _run_hook(cmd_template: str, out_dir: Path) -> tuple[bool, str]:
 
 def _process(
     qname: str,
+    sig_hash: str | None,
     model: str,
     second_pass: bool,
     agent: bool,
@@ -92,7 +93,7 @@ def _process(
     skip_existing: bool,
 ) -> Result:
     r = Result(qname)
-    out_dir = OUT_ROOT / sanitize_name(qname)
+    out_dir = OUT_ROOT / sanitize_name(qname, sig_hash)
 
     if skip_existing and (out_dir / "oracle" / "oracle.cc").exists():
         r.skipped = True
@@ -100,7 +101,9 @@ def _process(
 
     conn = connect()
     try:
-        result_dir = generate_one(conn, qname, model=model, second_pass=second_pass, agent=agent, verbose=verbose)
+        result_dir = generate_one(conn, qname, sig_hash=sig_hash,
+                                  model=model, second_pass=second_pass,
+                                  agent=agent, verbose=verbose)
     except urllib.error.URLError as e:
         r.error = f"Ollama unreachable: {e}"
         return r
@@ -190,34 +193,38 @@ def main() -> None:
     args = parser.parse_args()
 
     conn = connect()
-    qnames = get_class_functions(conn, args.class_name)
+    entries = get_class_functions(conn, args.class_name)
     conn.close()
 
-    if not qnames:
+    if not entries:
         print(f"No methods found for class: {args.class_name}", file=sys.stderr)
         sys.exit(1)
 
     if args.filter:
-        qnames = [q for q in qnames if args.filter in q]
-        if not qnames:
+        entries = [(q, s) for (q, s) in entries if args.filter in q]
+        if not entries:
             print(f"No methods match filter '{args.filter}'", file=sys.stderr)
             sys.exit(1)
 
     if args.list:
-        for q in qnames:
-            print(q)
-        print(f"\n{len(qnames)} methods")
+        for q, s in entries:
+            label = q if s is None else f"{q} [{s}]"
+            print(label)
+        print(f"\n{len(entries)} method overload(s)")
         return
 
-    print(f"Processing {len(qnames)} methods from {args.class_name} "
+    print(f"Processing {len(entries)} method(s)/overload(s) from {args.class_name} "
           f"(model={args.model}, workers={args.workers})")
 
     results: list[Result] = []
 
     if args.workers == 1:
-        for i, qname in enumerate(qnames, 1):
-            print(f"[{i}/{len(qnames)}] {qname.rsplit('::', 1)[-1]} ...", end=" ", flush=True)
-            r = _process(qname, args.model, args.second_pass, args.agent, args.verbose,
+        for i, (qname, sig_hash) in enumerate(entries, 1):
+            short = qname.rsplit("::", 1)[-1]
+            if sig_hash:
+                short = f"{short}#{sig_hash}"
+            print(f"[{i}/{len(entries)}] {short} ...", end=" ", flush=True)
+            r = _process(qname, sig_hash, args.model, args.second_pass, args.agent, args.verbose,
                          args.compile, args.test, args.skip_existing)
             results.append(r)
             if r.skipped:       print("skipped")
@@ -226,10 +233,10 @@ def main() -> None:
     else:
         futures = {}
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            for qname in qnames:
-                f = pool.submit(_process, qname, args.model, args.second_pass, args.agent, args.verbose,
+            for qname, sig_hash in entries:
+                f = pool.submit(_process, qname, sig_hash, args.model, args.second_pass, args.agent, args.verbose,
                                 args.compile, args.test, args.skip_existing)
-                futures[f] = qname
+                futures[f] = (qname, sig_hash)
             for f in as_completed(futures):
                 r = f.result()
                 results.append(r)

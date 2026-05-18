@@ -37,6 +37,7 @@ _TEST_NO_COMPILE_NUDGE = (
     "retries to fix them. Action over analysis."
 )
 from ..oracle.notes import load_notes, render_notes_for_prompt
+from ..oracle.coverage import load_coverage, render_for_prompt as render_coverage_for_prompt
 from ..oracle.runner.results import OracleResult
 from .compile import MAX_COMPILE_ATTEMPTS, compile_test_cc, run_test_binary
 
@@ -87,9 +88,12 @@ expected value. Fix the test, not the oracle.
 - grep_codebase          — text search across the source tree
 - get_base_classes       — list base classes of a type
 - find_symbol            — locate a symbol in header files
-- write_and_compile_test — write test.cc and compile+run it in one shot
+- write_and_compile_test — write COMPLETE test.cc and compile+run it in one shot
 - run_test               — re-run the last successfully compiled test binary
 - get_compile_errors     — return full (untruncated) compiler output
+- read_test              — read current test.cc from disk
+- patch_test             — apply a targeted old→new replacement to test.cc and recompile
+                           (prefer this over write_and_compile_test for small fixes after first write)
 
 # Workflow — terminal condition
 You are done when write_and_compile_test's response contains "All tests PASSED"
@@ -166,7 +170,51 @@ _GET_COMPILE_ERRORS_TOOL = {
     },
 }
 
-TEST_TOOLS = TOOLS + [_COMPILE_TEST_TOOL, _RUN_TEST_TOOL, _GET_COMPILE_ERRORS_TOOL]
+_READ_TEST_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_test",
+        "description": (
+            "Return the current contents of test.cc as written to disk. "
+            "Use this before patch_test to confirm the exact text you want to replace."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+_PATCH_TEST_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "patch_test",
+        "description": (
+            "Apply a targeted text replacement to the current test.cc and recompile. "
+            "By default old_string must appear exactly once — extend it with surrounding "
+            "context if it appears multiple times. Pass replace_all=true to replace every "
+            "occurrence (useful for renames). Prefer this over write_and_compile_test for "
+            "small fixes after the first successful write."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact substring to replace (must be unique in test.cc unless replace_all=true)",
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Replacement text",
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "If true, replace every occurrence of old_string. Defaults to false (single unique match).",
+                },
+            },
+            "required": ["old_string", "new_string"],
+        },
+    },
+}
+
+TEST_TOOLS = TOOLS + [_COMPILE_TEST_TOOL, _RUN_TEST_TOOL, _GET_COMPILE_ERRORS_TOOL, _READ_TEST_TOOL, _PATCH_TEST_TOOL]
 
 
 def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable, callable]:
@@ -240,10 +288,39 @@ def _make_tool_handlers(test_subdir: Path) -> tuple[callable, callable, callable
             return "No compile error log available."
         return last_error_log[0].read_text()
 
+    def read_handler() -> str:
+        test_cc = test_subdir / "test.cc"
+        if not test_cc.exists():
+            return "No test.cc written yet — call write_and_compile_test first."
+        return test_cc.read_text()
+
+    def patch_handler(old_string: str, new_string: str, replace_all: bool = False) -> str:
+        test_cc = test_subdir / "test.cc"
+        if not test_cc.exists():
+            return "No test.cc written yet — call write_and_compile_test first."
+        content = test_cc.read_text()
+        count = content.count(old_string)
+        if count == 0:
+            return (
+                "ERROR: old_string not found in test.cc. "
+                "Call read_test to verify the current content, then supply "
+                "an exact substring that appears in the file."
+            )
+        if count > 1 and not replace_all:
+            return (
+                f"ERROR: old_string appears {count} times — it must be unique. "
+                "Extend the string to include more surrounding context so it "
+                "identifies exactly one location, or pass replace_all=true to "
+                "replace every occurrence."
+            )
+        if replace_all:
+            return compile_handler(content.replace(old_string, new_string))
+        return compile_handler(content.replace(old_string, new_string, 1))
+
     def compiled_ok() -> bool:
         return last_binary[0] is not None
 
-    return compile_handler, run_handler, get_errors_handler, compiled_ok
+    return compile_handler, run_handler, get_errors_handler, read_handler, patch_handler, compiled_ok
 
 
 
@@ -262,7 +339,7 @@ def generate_test_with_agent(
     Returns (test_code, trace_text).
     test_code is None if the model produced nothing usable.
     """
-    compile_handler, run_handler, get_errors_handler, compiled_ok = _make_tool_handlers(test_subdir)
+    compile_handler, run_handler, get_errors_handler, read_handler, patch_handler, compiled_ok = _make_tool_handlers(test_subdir)
 
     def dispatch(name: str, args: dict) -> str:
         if name == "write_and_compile_test":
@@ -286,6 +363,14 @@ def generate_test_with_agent(
             return run_handler()
         if name == "get_compile_errors":
             return get_errors_handler()
+        if name == "read_test":
+            return read_handler()
+        if name == "patch_test":
+            old_s = args.get("old_string")
+            new_s = args.get("new_string")
+            if old_s is None or new_s is None:
+                return "Error: patch_test requires both 'old_string' and 'new_string'."
+            return patch_handler(old_s, new_s, bool(args.get("replace_all", False)))
         return _dispatch(conn, name, args)
 
     parts: list[str] = []
@@ -314,6 +399,19 @@ def generate_test_with_agent(
         if rendered:
             parts.append("## Validated facts from oracle stage")
             parts.append("_Reuse these verbatim rather than re-deriving._")
+            parts.append(f"```\n{rendered.rstrip()}\n```")
+
+    coverage = load_coverage(test_subdir.parent / "oracle" / "coverage.json")
+    if coverage:
+        rendered = render_coverage_for_prompt(coverage)
+        if rendered:
+            parts.append("## ⚠ Oracle coverage warning")
+            parts.append(
+                "_The oracle has weak coverage of the function. Translate "
+                "the existing INPUT/OUTPUT lines into assertions, but if "
+                "you can also add a complementary case that addresses the "
+                "weakness, do so._"
+            )
             parts.append(f"```\n{rendered.rstrip()}\n```")
 
     parts.append("## Task")
@@ -345,7 +443,7 @@ def generate_test_with_agent(
     call_counts: dict[str, int] = {}
     tool_cache: dict[str, str] = {}
     REPEAT_LIMIT = 3
-    NO_CACHE = {"write_and_compile_test", "run_test", "get_compile_errors", "leave_note"}
+    NO_CACHE = {"write_and_compile_test", "run_test", "get_compile_errors", "patch_test", "leave_note"}
     no_compile_warned = [False]
 
     def _save_draft(code: str) -> None:

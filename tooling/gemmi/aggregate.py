@@ -47,14 +47,17 @@ def _stem_from_file(source_file: str) -> str:
 
 
 def aggregate_gemmi_files(
-    qnames: list[str],
+    entries: list[tuple[str, str | None]] | list[str],
     source_file: str,
     out_root: Path = OUT_ROOT,
 ) -> tuple[Path, Path | None]:
     """Merge all per-function gemmi outputs into combined header/source files.
 
+    `entries` is either a list of (qname, sig_hash) tuples (new style,
+    one entry per overload) or a list of bare qnames (legacy callers).
+
     Returns (hh_path, cc_path) where cc_path is None if no function.cc existed.
-    Skips qnames whose gemmi/function.hh is absent (e.g. the gemmi stage failed).
+    Skips entries whose gemmi/function.hh is absent (e.g. the gemmi stage failed).
     """
     stem = _stem_from_file(source_file)
     agg_dir = out_root / "_aggregated"
@@ -67,18 +70,26 @@ def aggregate_gemmi_files(
     has_cc = False
     missing: list[str] = []
 
-    for qname in qnames:
-        gemmi_dir = out_root / sanitize_name(qname) / "gemmi"
+    normalized: list[tuple[str, str | None]] = []
+    for e in entries:
+        if isinstance(e, tuple):
+            normalized.append(e)
+        else:
+            normalized.append((e, None))
+
+    for qname, sig_hash in normalized:
+        gemmi_dir = out_root / sanitize_name(qname, sig_hash) / "gemmi"
+        label = qname if sig_hash is None else f"{qname} [{sig_hash}]"
 
         hh_path = gemmi_dir / "function.hh"
         if not hh_path.exists():
-            missing.append(qname)
+            missing.append(label)
             continue
 
         incs, body = _split_header(hh_path.read_text())
         hh_includes.extend(incs)
         if body:
-            hh_bodies.append(f"// --- {qname} ---\n{body}")
+            hh_bodies.append(f"// --- {label} ---\n{body}")
 
         cc_path = gemmi_dir / "function.cc"
         if cc_path.exists():
@@ -86,11 +97,11 @@ def aggregate_gemmi_files(
             incs_cc, body_cc = _split_header(cc_path.read_text())
             cc_includes.extend(incs_cc)
             if body_cc:
-                cc_bodies.append(f"// --- {qname} ---\n{body_cc}")
+                cc_bodies.append(f"// --- {label} ---\n{body_cc}")
 
     if missing:
-        print(f"[aggregate] skipped {len(missing)} functions with no gemmi output: "
-              + ", ".join(q.rsplit("::", 1)[-1] for q in missing))
+        print(f"[aggregate] skipped {len(missing)} entries with no gemmi output: "
+              + ", ".join(m.rsplit("::", 1)[-1] for m in missing))
 
     if not hh_bodies:
         print(f"[aggregate] nothing to aggregate for {source_file}")

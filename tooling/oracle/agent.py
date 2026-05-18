@@ -23,6 +23,8 @@ from pathlib import Path
 from ..db import (
     PROJECT_ROOT,
     get_function,
+    get_function_overloads,
+    sig_hash as _sig_hash,
     get_type,
     get_types_matching,
     get_type_methods,
@@ -73,6 +75,20 @@ NUDGE_EVERY_N_TURNS = int(os.environ.get("CT_AGENT_NUDGE_EVERY", 5))
 # names the tool explicitly. Targets the failure mode where the model
 # spends 12+ turns analysing instead of testing a draft. Set to 0 to disable.
 NO_COMPILE_AFTER = int(os.environ.get("CT_AGENT_NO_COMPILE_AFTER", 10))
+
+# Hard cap on lookup tool calls before the first compile_oracle attempt.
+# The system prompt asks for at most 6 lookups before compiling, but failed
+# runs do 13+ lookups on average. This intercept turns the prose suggestion
+# into a real gate: once the cap is hit, every further lookup is refused
+# with a forcing message until compile_oracle is attempted. Set to 0 to
+# disable. Tools counted as "lookups" are listed in LOOKUP_TOOLS_FOR_CAP below.
+LOOKUPS_BEFORE_COMPILE_CAP = int(os.environ.get("CT_LOOKUP_CAP", 10))
+
+LOOKUP_TOOLS_FOR_CAP: frozenset[str] = frozenset({
+    "read_file", "lookup_function", "lookup_type", "list_methods",
+    "get_callers", "find_header", "resolve_includes", "search_functions",
+    "grep_codebase", "inspect_pdb", "get_base_classes", "find_symbol",
+})
 
 NOTES_DIR        = Path(__file__).parent / "notes"
 ANSWER_MARKER    = "## Answer"
@@ -166,6 +182,9 @@ protected member access as if it were public. No friend declarations, no
 casts, no workarounds.
 
 # Workflow — terminal condition
+You have at most 20 turns. Aim to attempt your first compile_oracle by
+turn 10 — research is useful but a working draft beats a perfect plan.
+
 You are done when ALL of these hold:
   1. compile_oracle returned success on your latest code.
   2. run_oracle returned success and the output contains at least one
@@ -190,8 +209,11 @@ for style — the output is the artifact, not the code.
 - get_base_classes   — list base classes of a type
 - find_symbol        — locate a symbol in header files
 - leave_note         — record a domain question for future reference
-- compile_oracle     — compile the current oracle.cc draft
+- compile_oracle     — write the COMPLETE oracle.cc and compile it
 - run_oracle         — run the compiled oracle binary
+- read_oracle        — read current oracle.cc from disk
+- patch_oracle       — apply a targeted old→new replacement to oracle.cc and recompile
+                       (prefer this over compile_oracle for small fixes after first write)
 
 # Tool ordering
 - resolve_includes on your draft before the first compile.
@@ -296,12 +318,22 @@ TOOLS: list[dict] = [
             "name": "lookup_function",
             "description": (
                 "Return source code and documentation for a function by its "
-                "fully-qualified name, e.g. 'coot::molecule_t::cid_to_residue'."
+                "fully-qualified name, e.g. 'coot::molecule_t::cid_to_residue'. "
+                "If the function is overloaded, the first call returns the list "
+                "of overload signatures and their sig_hash values — call again "
+                "with sig_hash set to pick a specific one."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "qualified_name": {"type": "string"},
+                    "sig_hash": {
+                        "type": "string",
+                        "description": (
+                            "Optional 6-char overload hash returned by a previous "
+                            "lookup_function call. Use to pick one specific overload."
+                        ),
+                    },
                 },
                 "required": ["qualified_name"],
             },
@@ -345,12 +377,22 @@ TOOLS: list[dict] = [
             "name": "get_callers",
             "description": (
                 "Return example functions that call the given function, showing "
-                "real usage patterns and construction of receiver objects."
+                "real usage patterns and construction of receiver objects. "
+                "For overloaded callees, callers are identical across overloads, "
+                "so passing sig_hash is optional."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "qualified_name": {"type": "string"},
+                    "sig_hash": {
+                        "type": "string",
+                        "description": (
+                            "Optional 6-char signature hash to pin which overload "
+                            "of qualified_name to resolve. Safe to omit — callers "
+                            "are indexed by qname, not by id."
+                        ),
+                    },
                 },
                 "required": ["qualified_name"],
             },
@@ -369,6 +411,13 @@ TOOLS: list[dict] = [
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Type or function qualified name"},
+                    "sig_hash": {
+                        "type": "string",
+                        "description": (
+                            "Optional 6-char signature hash to pin which overload "
+                            "of a function name to resolve. Ignored when `name` is a type."
+                        ),
+                    },
                 },
                 "required": ["name"],
             },
@@ -566,7 +615,51 @@ _RUN_ORACLE_TOOL = {
     },
 }
 
-ORACLE_TOOLS = TOOLS + [_COMPILE_ORACLE_TOOL, _RUN_ORACLE_TOOL]
+_READ_ORACLE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_oracle",
+        "description": (
+            "Return the current contents of oracle.cc as written to disk. "
+            "Use this before patch_oracle to confirm the exact text you want to replace."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+_PATCH_ORACLE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "patch_oracle",
+        "description": (
+            "Apply a targeted text replacement to the current oracle.cc and recompile. "
+            "By default old_string must appear exactly once — extend it with surrounding "
+            "context if it appears multiple times. Pass replace_all=true to replace every "
+            "occurrence (useful for renames). Prefer this over compile_oracle for small "
+            "fixes after the first successful write."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact substring to replace (must be unique in oracle.cc unless replace_all=true)",
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Replacement text",
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "If true, replace every occurrence of old_string. Defaults to false (single unique match).",
+                },
+            },
+            "required": ["old_string", "new_string"],
+        },
+    },
+}
+
+ORACLE_TOOLS = TOOLS + [_COMPILE_ORACLE_TOOL, _RUN_ORACLE_TOOL, _READ_ORACLE_TOOL, _PATCH_ORACLE_TOOL]
 
 
 class _TraceWriter:
@@ -772,8 +865,29 @@ def _tool_read_file(path: str, offset: int = 0, limit: int = 300) -> str:
     return result
 
 
-def _tool_lookup_function(conn: sqlite3.Connection, qualified_name: str) -> str:
-    row = get_function(conn, qualified_name)
+def _tool_lookup_function(
+    conn: sqlite3.Connection,
+    qualified_name: str,
+    sig_hash: str | None = None,
+) -> str:
+    """Look up a function for the agent.
+
+    When `qualified_name` has multiple overloads and the agent didn't pin one
+    via `sig_hash`, list every overload's display_name + sig_hash and ask the
+    agent to call again with the disambiguator. Otherwise return the source.
+    """
+    overloads = get_function_overloads(conn, qualified_name)
+    if len(overloads) > 1 and sig_hash is None:
+        lines = [
+            f"Function '{qualified_name}' is overloaded ({len(overloads)} signatures). "
+            "Call lookup_function again with sig_hash set to the overload you want:",
+        ]
+        for r in overloads:
+            sh = _sig_hash(r["display_name"])
+            lines.append(f"  sig_hash={sh}  {r['display_name']}")
+        return "\n".join(lines)
+
+    row = get_function(conn, qualified_name, sig_hash)
     if not row:
         return f"Function '{qualified_name}' not found in DB."
     parts = []
@@ -865,6 +979,10 @@ def _tool_lookup_type(conn: sqlite3.Connection, name: str) -> str:
         lines.append("// HINT — common pitfalls:")
         for hint_line in hint.splitlines():
             lines.append(f"//   {hint_line}")
+    override = _load_override(row["qualified_name"])
+    if override:
+        lines.append("\n// --- Construction override (curated) ---")
+        lines.append(override)
     lines.append(row["summary"] or "(no summary)")
     if methods:
         lines.append("\n// Methods:")
@@ -898,8 +1016,12 @@ def _tool_list_methods(conn: sqlite3.Connection, class_name: str) -> str:
     return "\n".join(out)
 
 
-def _tool_get_callers(conn: sqlite3.Connection, qualified_name: str) -> str:
-    fn = get_function(conn, qualified_name)
+def _tool_get_callers(
+    conn: sqlite3.Connection,
+    qualified_name: str,
+    sig_hash: str | None = None,
+) -> str:
+    fn = get_function(conn, qualified_name, sig_hash)
     if not fn:
         return f"Function '{qualified_name}' not found."
     callers = get_callers_with_source(conn, fn["id"], limit=3)
@@ -915,13 +1037,17 @@ def _tool_get_callers(conn: sqlite3.Connection, qualified_name: str) -> str:
     return "\n\n".join(parts)
 
 
-def _tool_find_header(conn: sqlite3.Connection, name: str) -> str:
+def _tool_find_header(
+    conn: sqlite3.Connection,
+    name: str,
+    sig_hash: str | None = None,
+) -> str:
     file_path = None
     row = get_type(conn, name)
     if row:
         file_path = row["file"]
     else:
-        fn = get_function(conn, name)
+        fn = get_function(conn, name, sig_hash)
         if fn:
             file_path = fn["file"]
     if not file_path:
@@ -1510,10 +1636,39 @@ def _make_oracle_tool_handlers(oracle_out: Path) -> tuple[callable, callable, ca
             )
         return result
 
+    def read_handler() -> str:
+        oracle_cc = oracle_out / "oracle.cc"
+        if not oracle_cc.exists():
+            return "No oracle.cc written yet — call compile_oracle first."
+        return oracle_cc.read_text()
+
+    def patch_handler(old_string: str, new_string: str, replace_all: bool = False) -> str:
+        oracle_cc = oracle_out / "oracle.cc"
+        if not oracle_cc.exists():
+            return "No oracle.cc written yet — call compile_oracle first."
+        content = oracle_cc.read_text()
+        count = content.count(old_string)
+        if count == 0:
+            return (
+                "ERROR: old_string not found in oracle.cc. "
+                "Call read_oracle to verify the current content, then supply "
+                "an exact substring that appears in the file."
+            )
+        if count > 1 and not replace_all:
+            return (
+                f"ERROR: old_string appears {count} times — it must be unique. "
+                "Extend the string to include more surrounding context so it "
+                "identifies exactly one location, or pass replace_all=true to "
+                "replace every occurrence."
+            )
+        if replace_all:
+            return compile_handler(content.replace(old_string, new_string))
+        return compile_handler(content.replace(old_string, new_string, 1))
+
     def compiled_ok() -> bool:
         return last_binary[0] is not None
 
-    return compile_handler, run_handler, compiled_ok
+    return compile_handler, run_handler, read_handler, patch_handler, compiled_ok
 
 
 def _dispatch(
@@ -1525,15 +1680,17 @@ def _dispatch(
     if name == "read_file":
         return _tool_read_file(args["path"], args.get("offset", 0), args.get("limit", 300))
     if name == "lookup_function":
-        return _tool_lookup_function(conn, args["qualified_name"])
+        return _tool_lookup_function(
+            conn, args["qualified_name"], args.get("sig_hash"),
+        )
     if name == "lookup_type":
         return _tool_lookup_type(conn, args["name"])
     if name == "list_methods":
         return _tool_list_methods(conn, args["class_name"])
     if name == "get_callers":
-        return _tool_get_callers(conn, args["qualified_name"])
+        return _tool_get_callers(conn, args["qualified_name"], args.get("sig_hash"))
     if name == "find_header":
-        return _tool_find_header(conn, args["name"])
+        return _tool_find_header(conn, args["name"], args.get("sig_hash"))
     if name == "resolve_includes":
         return _tool_resolve_includes(args["code"])
     if name == "search_functions":
@@ -1573,6 +1730,7 @@ def generate_with_agent(
     verbose: bool = False,
     pdb_file: str = "example.pdb",
     pdb_note: str = "",
+    sig_hash: str | None = None,
 ) -> tuple[str | None, str]:
     """Run the agentic oracle generation loop.
 
@@ -1583,8 +1741,10 @@ def generate_with_agent(
     pdb_file: filename (relative to test-data/) of the example PDB to use.
     pdb_note: injected into the prompt when the choice was ambiguous, listing
               all available PDB files so the LLM can choose.
+    sig_hash: when `function_qname` is overloaded, pins which overload to
+              target. None falls back to whichever overload sqlite returns.
     """
-    fn = get_function(conn, function_qname)
+    fn = get_function(conn, function_qname, sig_hash)
     if not fn:
         return None, "Function not found in DB."
 
@@ -1685,8 +1845,9 @@ def generate_with_agent(
     trace_lines.append(f"=== AGENT TRACE: {function_qname} ===\n")
     trace_lines.append(f"[user]\n{textwrap.indent(user_content, '  ')}\n")
 
-    compile_handler, run_handler, compiled_ok = (
-        _make_oracle_tool_handlers(oracle_out) if oracle_out else (None, None, lambda: False)
+    compile_handler, run_handler, read_handler, patch_handler, compiled_ok = (
+        _make_oracle_tool_handlers(oracle_out)
+        if oracle_out else (None, None, None, None, lambda: False)
     )
 
     def dispatch(name: str, args: dict) -> str:
@@ -1712,21 +1873,33 @@ def generate_with_agent(
                     + run_msg
                 )
             return run_handler()
-        if name in ("compile_oracle", "run_oracle"):
+        if name == "read_oracle" and read_handler:
+            return read_handler()
+        if name == "patch_oracle" and patch_handler:
+            old_s = args.get("old_string")
+            new_s = args.get("new_string")
+            if old_s is None or new_s is None:
+                return "Error: patch_oracle requires both 'old_string' and 'new_string'."
+            return patch_handler(old_s, new_s, bool(args.get("replace_all", False)))
+        if name in ("compile_oracle", "run_oracle", "read_oracle", "patch_oracle"):
             return "Tool unavailable — no output directory configured."
         return _dispatch(conn, name, args, pdb_path=selected_pdb_path)
 
     tools = ORACLE_TOOLS if oracle_out else TOOLS
     oracle_code: str | None = None
     last_draft: list[str | None] = [None]    # any cpp draft we've ever seen (fallback)
+    last_compiled_draft: list[str | None] = [None]  # last code that actually compiled
     call_counts: dict[str, int] = {}         # repeat-call detection
     tool_cache: dict[str, str] = {}          # memoize read-only lookups within a session
     REPEAT_LIMIT = 3
     no_compile_warned = [False]              # one-shot guard for the no-compile nudge
     degen_recoveries = [0]                   # how many times we've nudged out of a degen loop
+    # Fresh lookup calls (i.e. NOT cached, NOT intercepted) before the first
+    # compile_oracle. Used by the lookup-cap gate below.
+    lookup_count = [0]
     # Tools whose output may differ across calls or which have side effects —
     # never serve from cache.
-    NO_CACHE = {"compile_oracle", "run_oracle", "leave_note"}
+    NO_CACHE = {"compile_oracle", "run_oracle", "patch_oracle", "leave_note"}
 
     def _save_draft(code: str) -> None:
         if code and len(code) > 100 and "#include" in code:
@@ -1781,9 +1954,55 @@ def generate_with_agent(
                 results.append({"role": "tool", "content": nudge})
                 continue
 
+            # Hard lookup cap: once the agent has burned LOOKUPS_BEFORE_COMPILE_CAP
+            # fresh lookup calls without ever calling compile_oracle, block
+            # every further lookup until it compiles. The system prompt asks
+            # for the same cap as prose; this gate makes it bind. Cached and
+            # already-intercepted calls don't reach here so they don't burn
+            # the budget. Compile + run tools always go through unimpeded.
+            has_compiled_yet = any(
+                k.startswith("compile_oracle:") for k in call_counts
+            )
+            if (LOOKUPS_BEFORE_COMPILE_CAP > 0
+                    and not has_compiled_yet
+                    and name in LOOKUP_TOOLS_FOR_CAP):
+                if lookup_count[0] >= LOOKUPS_BEFORE_COMPILE_CAP:
+                    intercept = (
+                        f"BLOCKED: you have made {lookup_count[0]} lookup tool "
+                        f"calls without a single compile_oracle attempt. The "
+                        f"cap is {LOOKUPS_BEFORE_COMPILE_CAP} — further lookups "
+                        "are refused until you compile. Your next call MUST be "
+                        "compile_oracle with your best draft of oracle.cc. "
+                        "Compiler errors are far more useful than further "
+                        "speculation; failures are expected and you have "
+                        "multiple retries to fix them. This block does not "
+                        "count against your compile budget."
+                    )
+                    trace_lines.append(
+                        f"  → [lookup-cap-blocked × {lookup_count[0]}] {name}({json.dumps(hash_args)})"
+                    )
+                    trace_lines.append(textwrap.indent(intercept, "      ") + "\n")
+                    trace_lines.append_call(
+                        f"[lookup-cap-blocked × {lookup_count[0]}] {name}({json.dumps(hash_args)})"
+                    )
+                    results.append({"role": "tool", "content": intercept})
+                    continue
+                lookup_count[0] += 1
+
             if verbose:
                 print(f"  tool: {name}({args})")
             result = dispatch(name, args)
+
+            # Capture the draft that actually compiled. We can only trust a
+            # draft for rescue / downstream use once compile_oracle has
+            # returned "Compilation succeeded" on it; speculative drafts
+            # poison every later stage because the broken code propagates
+            # into oracle.cc, test.cc, then function.hh.
+            if (name == "compile_oracle"
+                    and isinstance(args.get("code"), str)
+                    and "Compilation succeeded" in result):
+                last_compiled_draft[0] = args["code"]
+
             result_lines = result.splitlines()
             if len(result_lines) > 150:
                 result = "\n".join(result_lines[:150]) + f"\n... ({len(result_lines) - 150} more lines)"
@@ -1942,35 +2161,39 @@ def generate_with_agent(
             else:
                 trace_lines.append("[agent] Extension exhausted without final answer.\n")
 
-    # ── Rescue: recover a draft if the final turn produced nothing usable ────
+    # ── Final selection: only ever ship a draft that actually compiled ──────
+    # `last_compiled_draft` is populated by `_run_tool_calls` only when
+    # `compile_oracle` returned success on the supplied code. Any other
+    # draft (the agent's final message, the last attempted compile, a
+    # speculative one-shot rescue) might not even parse and would poison
+    # the test + gemmi stages that consume oracle.cc as ground truth — the
+    # broken code propagates into test.cc and then function.hh, and the
+    # whole pipeline reports the function as failed downstream instead of
+    # cleanly here. So: trust the compiler, not the agent's last word.
     def _is_usable(code: str | None) -> bool:
         return bool(code and len(code) > 100 and "#include" in code)
 
-    if not _is_usable(oracle_code):
-        if _is_usable(last_draft[0]):
-            trace_lines.append("[rescue] final turn had no code block — reusing last seen draft.\n")
-            oracle_code = last_draft[0]
+    if _is_usable(last_compiled_draft[0]):
+        if (_is_usable(oracle_code)
+                and oracle_code.strip() != last_compiled_draft[0].strip()):
+            trace_lines.append(
+                "[final] Final assistant message differs from last compiled "
+                "draft — trusting the draft that actually compiled.\n"
+            )
+        oracle_code = last_compiled_draft[0]
+    else:
+        if _is_usable(oracle_code):
+            trace_lines.append(
+                "[final] Final message produced code but it was never "
+                "compiled in this session — discarding to avoid shipping "
+                "broken code. Run is marked failed; batch will retry.\n"
+            )
         else:
-            trace_lines.append("[rescue] no draft found — one-shot asking for final output.\n")
-            messages.append({"role": "user", "content": (
-                "STOP. Do not call any tools. Output your best attempt at oracle.cc "
-                "NOW inside a single ```cpp block. This is your last chance — "
-                "partial or imperfect code is better than nothing."
-            )})
-            try:
-                data = _chat(messages, model, tools=[])
-                _log_llm_timing(data, stage="oracle", turn="rescue", verbose=verbose, trace_lines=trace_lines)
-                assistant_content = (data.get("message") or {}).get("content") or ""
-                trace_lines.append(f"[rescue — response]\n{textwrap.indent(assistant_content, '  ')}\n")
-                rescued = _extract_code(assistant_content)
-                if _is_usable(rescued):
-                    oracle_code = rescued
-                elif _is_usable(last_draft[0]):
-                    oracle_code = last_draft[0]
-            except (urllib.error.URLError, json.JSONDecodeError) as e:
-                trace_lines.append(f"[rescue] failed: {e}\n")
-                if _is_usable(last_draft[0]):
-                    oracle_code = last_draft[0]
+            trace_lines.append(
+                "[final] No compiled draft and no usable final output — "
+                "run failed.\n"
+            )
+        oracle_code = None
 
     # Notify about any notes that still need an answer.
     unanswered = _unanswered_notes()

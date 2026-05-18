@@ -58,13 +58,15 @@ _GEMMI_NO_COMPILE_NUDGE = (
 )
 from ..oracle.compile import GEMMI_INCLUDE
 from ..oracle.notes import load_notes, render_notes_for_prompt
+from ..oracle.coverage import load_coverage, render_for_prompt as render_coverage_for_prompt
 from .compile import (
     MAX_COMPILE_ATTEMPTS, compile_gemmi, run_gemmi_test_binary,
     write_compile_script,
 )
 from .lint import gemmi_lint, lint_report
+from .name_check import name_check_report, has_name_findings
 from .cheat_lookup import mmdb_to_gemmi, include_for_symbol
-from ..oracle.generate import OUT_ROOT, sanitize_name
+from ..oracle.generate import OUT_ROOT, sanitize_name, find_function_dirs
 
 _GEMMI_NO_COMPILE_AFTER = 10
 
@@ -119,10 +121,19 @@ def _has_gemmi_port(callee_qname: str) -> bool:
 
     `function.hh` is only written by `generate.py` after compile+run both
     pass, so its presence is the reliable success signal — see
-    `tooling/gemmi/generate.py:_write_files`.
+    `tooling/gemmi/generate.py:_write_files`. When the callee is overloaded
+    we have one dir per overload (`<sanitized>__<sig>/`); ANY of them
+    counting as ported is enough for downstream code that just needs the
+    symbol to be linkable.
     """
-    return (OUT_ROOT / sanitize_name(callee_qname)
-            / "gemmi" / "function.hh").is_file()
+    return any((d / "gemmi" / "function.hh").is_file()
+               for d in find_function_dirs(callee_qname))
+
+
+def _gemmi_port_dirs(callee_qname: str) -> list[Path]:
+    """Every per-overload output dir that has a verified gemmi port."""
+    return [d for d in find_function_dirs(callee_qname)
+            if (d / "gemmi" / "function.hh").is_file()]
 
 
 def _gemmi_target_name(qname: str) -> str:
@@ -136,21 +147,27 @@ def _gemmi_target_name(qname: str) -> str:
 def _all_gemmi_ports(conn: sqlite3.Connection) -> list[str]:
     """Return all coot qualified names that have a verified gemmi port.
 
-    A port is "verified" when `<sanitized>/gemmi/function.hh` exists — see
-    `_has_gemmi_port`. `sanitize_name` is lossy so we recover qnames by
-    matching against the DB's distinct qualified_name set.
+    A port is "verified" when `<sanitized>[__<sig>]/gemmi/function.hh`
+    exists — see `_has_gemmi_port`. `sanitize_name` is lossy AND overloads
+    add a `__<sig>` suffix; we strip the suffix before mapping back to the
+    DB's distinct qualified_name set. Multiple overload dirs for the same
+    qname collapse to a single returned qname.
     """
-    ported_dirs = {
+    ported_dir_names = {
         p.parent.parent.name
         for p in OUT_ROOT.glob("*/gemmi/function.hh")
     }
-    if not ported_dirs:
+    if not ported_dir_names:
         return []
+    # Strip `__<6 hex>` suffix (only present for overloaded names).
+    base_names = {
+        re.sub(r"__[0-9a-f]{6}$", "", d) for d in ported_dir_names
+    }
     rows = conn.execute("SELECT DISTINCT qualified_name FROM functions").fetchall()
     by_sanitized: dict[str, str] = {}
     for (q,) in rows:
         by_sanitized.setdefault(sanitize_name(q), q)
-    return sorted({by_sanitized[d] for d in ported_dirs if d in by_sanitized})
+    return sorted({by_sanitized[d] for d in base_names if d in by_sanitized})
 
 
 _LINE_COMMENT_RE = re.compile(r"//[^\n]*")
@@ -241,13 +258,29 @@ def _port_entry(qname: str) -> dict:
     """Render a single port as the structured dict returned by the tool.
 
     `qname` here is the ORIGINAL MMDB function's qname (the directory's
-    source). The actual ported callable(s) are parsed from function.hh.
+    source). The actual ported callable(s) are parsed from function.hh —
+    one entry per overload dir, merged into a single decls list.
     """
-    header = OUT_ROOT / sanitize_name(qname) / "gemmi" / "function.hh"
+    dirs = _gemmi_port_dirs(qname)
+    if not dirs:
+        # Fall back to the legacy single-overload path so callers that pass
+        # a qname for which no port-dir glob matched still get a sensible
+        # `header` field pointing to where one would live.
+        dirs = [OUT_ROOT / sanitize_name(qname)]
+    headers = [d / "gemmi" / "function.hh" for d in dirs]
+    decls: list[dict] = []
+    seen_decl: set[str] = set()
+    for h in headers:
+        for d in _parse_gemmi_decls(h):
+            if d["qname"] in seen_decl:
+                continue
+            seen_decl.add(d["qname"])
+            decls.append(d)
     return {
         "source_qname": qname,
-        "header": str(header),
-        "decls": _parse_gemmi_decls(header),
+        "header": str(headers[0]) if len(headers) == 1 else
+                  ", ".join(str(h) for h in headers),
+        "decls": decls,
     }
 
 
@@ -336,21 +369,26 @@ def _transitive_ported_deps(
 
 
 def _dep_extra_includes(conn: sqlite3.Connection, qname: str) -> list[Path]:
-    """One gemmi/ dir per transitively ported dep — needed on -I so each
-    dep's function.cc can resolve its own `#include "function.hh"`.
+    """One gemmi/ dir per transitively ported dep overload — needed on -I so
+    each dep's function.cc can resolve its own `#include "function.hh"`.
+    An overloaded callee contributes one -I per overload's gemmi dir.
     """
-    return [
-        OUT_ROOT / sanitize_name(dep) / "gemmi"
-        for dep in _transitive_ported_deps(conn, qname)
-    ]
+    out: list[Path] = []
+    for dep in _transitive_ported_deps(conn, qname):
+        for d in _gemmi_port_dirs(dep):
+            out.append(d / "gemmi")
+    return out
 
 
 def _dep_extra_sources(conn: sqlite3.Connection, qname: str) -> list[Path]:
-    """function.cc paths for all transitively ported deps that have one."""
-    return [
-        cc for dep in _transitive_ported_deps(conn, qname)
-        if (cc := OUT_ROOT / sanitize_name(dep) / "gemmi" / "function.cc").is_file()
-    ]
+    """function.cc paths for all transitively ported dep overloads that have one."""
+    out: list[Path] = []
+    for dep in _transitive_ported_deps(conn, qname):
+        for d in _gemmi_port_dirs(dep):
+            cc = d / "gemmi" / "function.cc"
+            if cc.is_file():
+                out.append(cc)
+    return out
 
 
 def _extract_test_fixtures(test_cc: str) -> list[str]:
@@ -807,7 +845,10 @@ Max {MAX_COMPILE_ATTEMPTS} compile attempts total.
 - include_for_symbol — canonical #include for a gemmi/gtest symbol
 - find_gemmi_port    — check whether a verified _gemmi port exists
 - list_gemmi_ports   — list all verified gemmi ports
-- write_gemmi_file   — write function.hh / function.cc / test.cc to disk
+- write_gemmi_file   — write COMPLETE function.hh / function.cc / test.cc to disk
+- read_gemmi_file    — read current on-disk contents of a port file
+- patch_gemmi_file   — apply a targeted old→new replacement to a port file and recompile
+                       (prefer this over write_gemmi_file for small fixes after first write)
 - run_gemmi_test     — re-run the last successfully compiled test binary
 - get_compile_errors — return full (untruncated) compiler output
 
@@ -1006,11 +1047,12 @@ _WRITE_FILE_TOOL = {
     "function": {
         "name": "write_gemmi_file",
         "description": (
-            "Write one of the three gemmi port files to disk. "
+            "Write COMPLETE contents of one gemmi port file to disk. "
             "Writing test.cc automatically compiles and runs the test — "
             "this is the ONLY way to compile in this stage. "
             "Order: function.cc first (if needed), then function.hh, then "
-            "test.cc to trigger the build."
+            "test.cc to trigger the build. "
+            "For small fixes after the first write, prefer patch_gemmi_file."
         ),
         "parameters": {
             "type": "object",
@@ -1030,6 +1072,68 @@ _WRITE_FILE_TOOL = {
     },
 }
 
+_READ_GEMMI_FILE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_gemmi_file",
+        "description": (
+            "Return the current on-disk contents of a gemmi port file "
+            "(function.hh, function.cc, or test.cc). "
+            "Use this before patch_gemmi_file to confirm the exact text to replace."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "enum": ["function.hh", "function.cc", "test.cc"],
+                    "description": "Which file to read",
+                },
+            },
+            "required": ["filename"],
+        },
+    },
+}
+
+_PATCH_GEMMI_FILE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "patch_gemmi_file",
+        "description": (
+            "Apply a targeted text replacement to a gemmi port file and "
+            "trigger recompile. By default old_string must appear exactly "
+            "once — extend it with surrounding context if it appears multiple "
+            "times. Pass replace_all=true to replace every occurrence (useful "
+            "for renames). Prefer this over write_gemmi_file for small fixes "
+            "after the first write. Writing test.cc or any file when both "
+            "function.hh and test.cc exist triggers an automatic compile+run."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "enum": ["function.hh", "function.cc", "test.cc"],
+                    "description": "Which file to patch",
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact substring to replace (must be unique in the file unless replace_all=true)",
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Replacement text",
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "If true, replace every occurrence of old_string. Defaults to false (single unique match).",
+                },
+            },
+            "required": ["filename", "old_string", "new_string"],
+        },
+    },
+}
+
 # Filter inspect_pdb out — fixtures are injected into the user prompt verbatim,
 # so the tool gets called wastefully (29× across the corpus despite a "do NOT
 # call" instruction). Don't expose it during the gemmi stage.
@@ -1040,6 +1144,7 @@ _GEMMI_BASE_TOOLS = [
 
 GEMMI_TOOLS = _GEMMI_BASE_TOOLS + [
     _RUN_TOOL, _GET_ERRORS_TOOL, _WRITE_FILE_TOOL,
+    _READ_GEMMI_FILE_TOOL, _PATCH_GEMMI_FILE_TOOL,
     _MMDB_TO_GEMMI_TOOL, _INCLUDE_FOR_SYMBOL_TOOL,
     _FIND_GEMMI_PORT_TOOL, _LIST_GEMMI_PORTS_TOOL,
 ]
@@ -1177,6 +1282,7 @@ def _make_tool_handlers(
     extra_includes: list[Path] | None = None,
     extra_sources: list[Path] | None = None,
     original_test_cc: str = "",
+    conn: sqlite3.Connection | None = None,
 ) -> tuple[callable, callable, callable]:
     attempts       = [0]
     last_binary    = [None]
@@ -1228,6 +1334,17 @@ def _make_tool_handlers(
                 "below and rewrite the affected file(s) with write_gemmi_file. "
                 "These are anti-patterns the compiler would also reject:\n\n"
                 + "\n\n".join(lint_sections)
+            )
+
+        # Pre-flight name check — catches `gemmi::Foo` / `mmdb::Foo` / etc.
+        # whose qualified names don't resolve in the code graph DB or the
+        # gemmi symbol index. Also a free fix cycle. Skipped when no DB
+        # connection is available (older callers).
+        if conn is not None and has_name_findings(
+            function_hh, test_cc, function_cc, conn,
+        ):
+            return name_check_report(
+                function_hh, test_cc, function_cc, conn,
             )
 
         attempts[0] += 1
@@ -1337,10 +1454,47 @@ def _make_tool_handlers(
         missing = [f for f in ("function.hh", "test.cc") if not (gemmi_subdir / f).exists()]
         return f"'{filename}' written. Still waiting for: {', '.join(missing)}"
 
+    def read_file_handler(filename: str) -> str:
+        allowed = {"function.hh", "function.cc", "test.cc"}
+        if filename not in allowed:
+            return f"ERROR: filename must be one of {sorted(allowed)}."
+        path = gemmi_subdir / filename
+        if not path.exists():
+            return f"'{filename}' has not been written yet — call write_gemmi_file first."
+        return path.read_text()
+
+    def patch_file_handler(filename: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+        allowed = {"function.hh", "function.cc", "test.cc"}
+        if filename not in allowed:
+            return f"ERROR: filename must be one of {sorted(allowed)}."
+        path = gemmi_subdir / filename
+        if not path.exists():
+            return f"'{filename}' has not been written yet — call write_gemmi_file first."
+        content = path.read_text()
+        count = content.count(old_string)
+        if count == 0:
+            return (
+                f"ERROR: old_string not found in {filename}. "
+                "Call read_gemmi_file to verify the current content, then supply "
+                "an exact substring that appears in the file."
+            )
+        if count > 1 and not replace_all:
+            return (
+                f"ERROR: old_string appears {count} times in {filename} — it must be unique. "
+                "Extend the string to include more surrounding context so it "
+                "identifies exactly one location, or pass replace_all=true to "
+                "replace every occurrence."
+            )
+        if replace_all:
+            patched = content.replace(old_string, new_string)
+        else:
+            patched = content.replace(old_string, new_string, 1)
+        return write_file_handler(filename, patched)
+
     def compiled_ok() -> bool:
         return last_binary[0] is not None
 
-    return compile_handler, run_handler, get_errors_handler, write_file_handler, compiled_ok
+    return compile_handler, run_handler, get_errors_handler, write_file_handler, read_file_handler, patch_file_handler, compiled_ok
 
 
 _BLOCK_RE = re.compile(
@@ -1414,8 +1568,9 @@ def generate_gemmi_port_with_agent(
     """Return ({file_name: contents, ...}, trace_text) or (None, trace) on failure."""
     dep_includes = _dep_extra_includes(conn, function_qname)
     dep_sources  = _dep_extra_sources(conn, function_qname)
-    compile_handler, run_handler, get_errors_handler, write_file_handler, compiled_ok = \
-        _make_tool_handlers(gemmi_subdir, dep_includes, dep_sources, original_test_cc)
+    compile_handler, run_handler, get_errors_handler, write_file_handler, read_file_handler, patch_file_handler, compiled_ok = \
+        _make_tool_handlers(gemmi_subdir, dep_includes, dep_sources,
+                            original_test_cc, conn=conn)
 
     assertion_dispatch_warned = [False]
 
@@ -1446,6 +1601,14 @@ def generate_gemmi_port_with_agent(
             return prefix + result
         if name == "write_gemmi_file":
             return write_file_handler(args.get("filename", ""), args.get("contents", ""))
+        if name == "read_gemmi_file":
+            return read_file_handler(args.get("filename", ""))
+        if name == "patch_gemmi_file":
+            old_s = args.get("old_string")
+            new_s = args.get("new_string")
+            if old_s is None or new_s is None:
+                return "Error: patch_gemmi_file requires 'filename', 'old_string', and 'new_string'."
+            return patch_file_handler(args.get("filename", ""), old_s, new_s, bool(args.get("replace_all", False)))
         if name == "run_gemmi_test":
             if not compiled_ok() and last_draft[0]:
                 draft = last_draft[0]
@@ -1564,19 +1727,22 @@ def generate_gemmi_port_with_agent(
                 "`.cc` files.**"
             )
             for c in ported:
-                hh = OUT_ROOT / sanitize_name(c) / "gemmi" / "function.hh"
-                decls = _parse_gemmi_decls(hh)
-                lines.append(f"  - `{c}`")
-                lines.append(f'    `#include "{hh}"`')
-                if decls:
-                    for d in decls:
-                        lines.append(f"    Call as: `{d['qname']}`")
-                        lines.append(f"      `{d['signature']}`")
-                else:
-                    # Header exists but no `*_gemmi` decl parsed — surface
-                    # the predicted target as a fallback hint.
-                    lines.append(f"    Call as: `{_gemmi_target_name(c)}` "
-                                 "(predicted; verify by reading the header)")
+                # An overloaded callee has one gemmi/function.hh per overload;
+                # surface every one so the agent picks the right signature.
+                for port_dir in _gemmi_port_dirs(c):
+                    hh = port_dir / "gemmi" / "function.hh"
+                    decls = _parse_gemmi_decls(hh)
+                    lines.append(f"  - `{c}`")
+                    lines.append(f'    `#include "{hh}"`')
+                    if decls:
+                        for d in decls:
+                            lines.append(f"    Call as: `{d['qname']}`")
+                            lines.append(f"      `{d['signature']}`")
+                    else:
+                        # Header exists but no `*_gemmi` decl parsed — surface
+                        # the predicted target as a fallback hint.
+                        lines.append(f"    Call as: `{_gemmi_target_name(c)}` "
+                                     "(predicted; verify by reading the header)")
             lines.append("")
         if unported:
             lines.append(
@@ -1633,6 +1799,19 @@ def generate_gemmi_port_with_agent(
             )
             parts.append(f"```\n{rendered.rstrip()}\n```")
 
+    coverage = load_coverage(gemmi_subdir.parent / "oracle" / "coverage.json")
+    if coverage:
+        rendered = render_coverage_for_prompt(coverage)
+        if rendered:
+            parts.append("## ⚠ Oracle coverage warning")
+            parts.append(
+                "_The oracle that produced the frozen assertions has weak "
+                "coverage of the original function. Treat the assertions as "
+                "necessary but not sufficient — when designing the port, "
+                "ensure the listed weaknesses are addressed in your test._"
+            )
+            parts.append(f"```\n{rendered.rstrip()}\n```")
+
     user_content = "\n\n".join(parts)
 
     messages: list[dict] = [
@@ -1656,7 +1835,7 @@ def generate_gemmi_port_with_agent(
     tool_cache: dict[str, str] = {}
     REPEAT_LIMIT = 3
     NO_CACHE = {"compile_gemmi", "run_gemmi_test", "get_compile_errors", "leave_note",
-                "write_gemmi_file"}
+                "write_gemmi_file", "patch_gemmi_file"}
     no_compile_warned = [False]
     degen_recovered = [False]
     compile_intent_strikes = [0]
