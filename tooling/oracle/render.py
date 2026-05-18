@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sqlite3
 import re
+from collections import defaultdict
 from pathlib import Path
 
 from ..db import (
@@ -111,6 +112,82 @@ INCLUDE_ROOTS = [
 _TEST_DATA_DIR = Path(__file__).parent.parent.parent / "test-data"
 
 
+_STANDARD_AA = {
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+    "SEC", "PYL",
+}
+
+
+def _ranges(nums: list[int]) -> str:
+    """Compress a sorted list of integers into a compact range string."""
+    if not nums:
+        return ""
+    ranges: list[str] = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+        else:
+            ranges.append(str(start) if start == prev else f"{start}-{prev}")
+            start = prev = n
+    ranges.append(str(start) if start == prev else f"{start}-{prev}")
+    return ", ".join(ranges)
+
+
+def _pdb_summary(pdb_path: str) -> str:
+    """Parse a PDB file and return a compact structure-content summary."""
+    path = Path(pdb_path)
+    if not path.exists():
+        return ""
+
+    chain_residues: dict[str, dict[int, str]] = defaultdict(dict)  # chain -> {seqnum -> resname}
+    with path.open() as fh:
+        for line in fh:
+            rec = line[:6].strip()
+            if rec not in ("ATOM", "HETATM"):
+                continue
+            try:
+                resname = line[17:20].strip()
+                chain = line[21].strip() or " "
+                seqnum = int(line[22:26].strip())
+            except (ValueError, IndexError):
+                continue
+            chain_residues[chain][seqnum] = resname
+
+    if not chain_residues:
+        return ""
+
+    lines: list[str] = ["STRUCTURE CONTENT:"]
+    has_ligand = False
+    for chain in sorted(chain_residues):
+        residues = chain_residues[chain]
+        aa_nums: list[int] = []
+        water_nums: list[int] = []
+        ligands: list[tuple[int, str]] = []
+        for seqnum, resname in sorted(residues.items()):
+            if resname in _STANDARD_AA:
+                aa_nums.append(seqnum)
+            elif resname == "HOH":
+                water_nums.append(seqnum)
+            else:
+                ligands.append((seqnum, resname))
+                has_ligand = True
+
+        parts: list[str] = []
+        if aa_nums:
+            parts.append(f"{len(aa_nums)} std amino acids (seq {_ranges(aa_nums)})")
+        if water_nums:
+            parts.append(f"{len(water_nums)} HOH")
+        for seqnum, resname in ligands:
+            parts.append(f"ligand {resname} at seq {seqnum}")
+        lines.append(f"  Chain {chain}: {'; '.join(parts)}")
+
+    if not has_ligand:
+        lines.append("  (no non-water ligands)")
+    return "\n".join(lines)
+
+
 def make_oracle_instructions(pdb_path: str, pdb_note: str = "") -> str:
     """Build the ORACLE_INSTRUCTIONS block with the given PDB path.
 
@@ -123,6 +200,8 @@ def make_oracle_instructions(pdb_path: str, pdb_note: str = "") -> str:
             "\n       (or choose a more appropriate file from the list below —\n"
             f"        the selected path is only a default)\n{pdb_note}"
         )
+    pdb_summary = _pdb_summary(pdb_path)
+    pdb_summary_block = f"\n{pdb_summary}\n" if pdb_summary else ""
     return f"""\
 Write a complete, compilable C++ program (oracle.cc) that observes the inputs
 and outputs of the function marked FUNCTION TO OBSERVE below.
@@ -131,8 +210,9 @@ Requirements:
   1. Be self-contained — hardcode the test file paths below, do not use argc/argv.
 {pdb_line}
        MTZ: {_TEST_DATA_DIR}/example.mtz
-  2. Load the structure using the hardcoded path.
+{pdb_summary_block}  2. Load the structure using the hardcoded path.
   3. Navigate the structure to reach a valid receiver/input for the function.
+     Use only residues/chains listed in STRUCTURE CONTENT above.
   4. Call the function.
   5. Print every input value and every meaningful output value using this format:
        INPUT  <name>: <value>
@@ -319,8 +399,9 @@ def build_oracle_prompt(
     function_qname: str,
     pdb_file: str = "example.pdb",
     pdb_note: str = "",
+    sig_hash: str | None = None,
 ) -> str | None:
-    fn = get_function(conn, function_qname)
+    fn = get_function(conn, function_qname, sig_hash)
     if not fn:
         return None
 

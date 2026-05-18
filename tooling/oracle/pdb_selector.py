@@ -19,11 +19,17 @@ PDB_CATALOG: dict[str, str] = {
     "example.pdb": (
         "standard protein (transferase 2VTQ, chains A+B, no hydrogens)"
     ),
-    "example_alphafold.pdb": (
+    "example-alphafold.pdb": (
         "AlphaFold predicted model (pLDDT confidence scores as B-factors, no CRYST1 record)"
     ),
     "example-hydrogen.pdb": (
         "protein with explicit hydrogen atoms added"
+    ),
+    "example-ligand.pdb": (
+        "small-molecule ligand only (no protein), for restraint generation / rdkit / SMILES workflows"
+    ),
+    "example-protein-ligand.cif": (
+        "protein-ligand complex (protein + bound small molecule), for pli / flev / contact / binding-site workflows"
     ),
 }
 
@@ -36,7 +42,7 @@ _KEYWORD_MAP: list[tuple[list[str], str]] = [
             "af2", "af3", "af_", "predicted_structure", "alphafold_score",
             "is_alphafold", "b_factor_type",
         ],
-        "example_alphafold.pdb",
+        "example-alphafold.pdb",
     ),
     (
         [
@@ -46,7 +52,34 @@ _KEYWORD_MAP: list[tuple[list[str], str]] = [
         ],
         "example-hydrogen.pdb",
     ),
+    (
+        [
+            "pli", "flev", "ligand_interaction", "protein_ligand",
+            "ligand_environment", "binding_site", "ligand_contact",
+            "ligand_water", "residues_near", "ligand_neighbour",
+            "contact_dots", "ligand_to_protein",
+        ],
+        "example-protein-ligand.cif",
+    ),
+    (
+        [
+            "rdkit", "smiles", "mol_file", "monomer_restraint",
+            "get_torsion", "ligand_only", "generate_restraint",
+            "dictionary_entry", "cif_dictionary", "mogul",
+            "acedrg", "ligand_builder",
+        ],
+        "example-ligand.pdb",
+    ),
 ]
+
+# Optional structural notes per file — shown to the LLM alongside the file path
+# so it knows where key molecules are located.  Leave a key out (or set to "")
+# to suppress the note for that file.
+_PDB_NOTES: dict[str, str] = {
+    "example-protein-ligand.cif": (
+        "The ligand LZA (residue 1299, chain A) is the bound small molecule of interest."
+    ),
+}
 
 _DEFAULT_PDB = "example.pdb"
 
@@ -80,6 +113,14 @@ def select_pdb(
 
 def pdb_path(filename: str) -> Path:
     return TEST_DATA_DIR / filename
+
+
+def structural_note(filename: str) -> str:
+    """Return a file-specific structural note (e.g. ligand location) for the LLM prompt.
+
+    Returns an empty string when no note is registered for *filename*.
+    """
+    return _PDB_NOTES.get(filename, "")
 
 
 def catalog_note(selected_file: str | None = None) -> str:
