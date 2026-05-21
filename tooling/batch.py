@@ -787,18 +787,20 @@ def main() -> None:
     )
     parser.add_argument("class_name", help="Fully-qualified class name, e.g. coot::molecule_t")
     parser.add_argument("--filter",        metavar="STR",  help="Only process methods whose name contains STR")
-    parser.add_argument("--mmdb-only",     action="store_true", help="Only process methods that use MMDB types (mmdb::*)")
+    parser.add_argument("--no-mmdb-only",  action="store_false", dest="mmdb_only", default=True,
+                        help="Include methods that don't use MMDB types (default: only MMDB methods)")
     parser.add_argument("--model",         default=DEFAULT_MODEL)
     parser.add_argument("--backend",       default="ollama", choices=["ollama", "openai"],
                         help="LLM backend (default: ollama)")
     parser.add_argument("--no-thinking",   action="store_true",
                         help="Disable reasoning/thinking output (sets CT_THINK=0)")
-    parser.add_argument("--agent",         action="store_true",  help="Agentic mode for both oracle and test generation")
+    parser.add_argument("--no-agent",      action="store_false", dest="agent", default=True,
+                        help="Disable agentic mode (default: agentic mode enabled)")
     parser.add_argument("--verbose",       action="store_true", help="Print thinking and tool calls to console")
     parser.add_argument("--skip-oracle",   action="store_true", help="Skip oracle generation if oracle.cc already exists; go straight to test generation")
     parser.add_argument("--skip-existing", action="store_true", help="Skip methods that already have oracle.cc")
-    parser.add_argument("--with-gemmi",    action="store_true",
-                        help="After test succeeds, also run the combined gemmi port + test stage")
+    parser.add_argument("--no-gemmi",      action="store_false", dest="with_gemmi", default=True,
+                        help="Skip gemmi port stage (default: gemmi is run)")
     parser.add_argument("--no-topo",       action="store_true",
                         help="Disable bottom-up call-graph ordering (default is enabled: "
                              "functions with no in-batch callees go first, so any callees "
@@ -926,17 +928,20 @@ def main_file() -> None:
     )
     parser.add_argument("file", help="Source file path (absolute, or a suffix of the stored path, e.g. src/coot/molecule.cc)")
     parser.add_argument("--filter",        metavar="STR",  help="Only process functions whose name contains STR")
-    parser.add_argument("--mmdb-only",     action="store_true", help="Only process functions that use MMDB types (mmdb::*)")
+    parser.add_argument("--no-mmdb-only",  action="store_false", dest="mmdb_only", default=True,
+                        help="Include functions that don't use MMDB types (default: only MMDB functions)")
     parser.add_argument("--model",         default=DEFAULT_MODEL)
     parser.add_argument("--backend",       default="ollama", choices=["ollama", "openai"],
                         help="LLM backend (default: ollama)")
     parser.add_argument("--no-thinking",   action="store_true",
                         help="Disable reasoning/thinking output (sets CT_THINK=0)")
-    parser.add_argument("--agent",         action="store_true",  help="Agentic mode for oracle, test, and gemmi generation")
+    parser.add_argument("--no-agent",      action="store_false", dest="agent", default=True,
+                        help="Disable agentic mode (default: agentic mode enabled)")
     parser.add_argument("--verbose",       action="store_true",  help="Print thinking and tool calls to console")
     parser.add_argument("--skip-oracle",   action="store_true",  help="Skip oracle generation if oracle.cc already exists")
     parser.add_argument("--skip-existing", action="store_true",  help="Skip functions that already have oracle.cc")
-    parser.add_argument("--no-gemmi",      action="store_true",  help="Skip gemmi port stage (default: gemmi is run)")
+    parser.add_argument("--no-gemmi",      action="store_false", dest="with_gemmi", default=True,
+                        help="Skip gemmi port stage (default: gemmi is run)")
     parser.add_argument("--no-topo",       action="store_true",  help="Disable bottom-up call-graph ordering")
     parser.add_argument("--with-deps",     action="store_true",
                         help="Also include transitive callees of the selected functions so "

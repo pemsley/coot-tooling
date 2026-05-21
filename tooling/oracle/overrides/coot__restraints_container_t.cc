@@ -7,6 +7,10 @@
 // Do NOT set udd_atom_index_handle or other private fields manually —
 // they are populated as a side-effect of construction.
 
+// THIS DEFINE MUST BE AT THE TOP OF THE FILE OR IT WILL NOT COMPILE.
+#define HAVE_BOOST_BASED_THREAD_POOL_LIBRARY
+
+
 ```cpp
 molecules_container_t mc;
 int imol     = mc.read_pdb("@PDB_PATH@");

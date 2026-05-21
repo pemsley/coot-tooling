@@ -1037,6 +1037,9 @@ def _tool_get_callers(
     return "\n\n".join(parts)
 
 
+_HEADER_EXTS = (".hh", ".h", ".hpp", ".hxx")
+
+
 def _tool_find_header(
     conn: sqlite3.Connection,
     name: str,
@@ -1047,13 +1050,32 @@ def _tool_find_header(
     if row:
         file_path = row["file"]
     else:
-        fn = get_function(conn, name, sig_hash)
-        if fn:
-            file_path = fn["file"]
+        # Prefer a declaration in a header file over a definition in a .cc —
+        # find_header is asking "what should I #include", not "where is the body".
+        header_row = conn.execute("""
+            SELECT fi.path AS file
+            FROM functions f JOIN files fi ON fi.id = f.file_id
+            WHERE f.qualified_name = ?
+              AND (fi.path LIKE '%.hh' OR fi.path LIKE '%.h'
+                   OR fi.path LIKE '%.hpp' OR fi.path LIKE '%.hxx')
+            ORDER BY f.is_definition ASC, f.line_start
+            LIMIT 1
+        """, (name,)).fetchone()
+        if header_row:
+            file_path = header_row["file"]
+        else:
+            fn = get_function(conn, name, sig_hash)
+            if fn:
+                file_path = fn["file"]
     if not file_path:
         return f"No type or function '{name}' found in DB."
     include = _to_include(file_path)
-    return f'Absolute path: {file_path}\n#include "{include}"'
+    note = ""
+    if not file_path.endswith(_HEADER_EXTS):
+        note = ("\nNote: only a definition in a source file was found; "
+                "no header declaration is recorded in the DB. "
+                "Do NOT #include a .cc/.cpp file — check the matching header by hand.")
+    return f'Absolute path: {file_path}\n#include "{include}"{note}'
 
 
 def _tool_leave_note(topic: str, question: str) -> str:
@@ -1378,8 +1400,83 @@ def _tool_grep_codebase(
     return "\n".join(matches)
 
 
+def _inspect_cif(
+    pdb_path: Path,
+    chain: str | None,
+    records: dict,
+) -> str | None:
+    """Populate *records* from a coordinate mmCIF, or return a monomer-dictionary summary.
+
+    Returns None when *records* was filled (caller renders normally), or a ready
+    string when the file is a CCP4-style monomer/restraint dictionary that has
+    no `_atom_site` block.
+    """
+    try:
+        import gemmi
+    except ImportError:
+        return f"ERROR: gemmi not available to parse {pdb_path.name}."
+
+    try:
+        s = gemmi.read_structure(str(pdb_path))
+    except Exception as exc:
+        s = None
+        struct_err: Exception | None = exc
+    else:
+        struct_err = None
+
+    has_atoms = bool(s) and any(len(c) for m in s for c in m)
+    if has_atoms:
+        for model in s:
+            for c in model:
+                cid = c.name or "_"
+                for r in c:
+                    for a in r:
+                        records[cid].append(
+                            (r.seqid.num, (r.seqid.icode or "").strip(),
+                             r.name, a.name)
+                        )
+            break  # first model only
+        return None
+
+    # Monomer/restraint dictionary fallback (data_comp_<id> with _chem_comp_atom).
+    try:
+        doc = gemmi.cif.read(str(pdb_path))
+    except Exception as exc:
+        return f"ERROR: failed to parse {pdb_path.name}: {exc}"
+
+    comps: list[tuple[str, list[tuple[str, str]]]] = []
+    for block in doc:
+        atoms_loop = block.find(
+            "_chem_comp_atom.", ["comp_id", "atom_id", "type_symbol"]
+        )
+        rows = [(r[0], r[1], r[2]) for r in atoms_loop]
+        if not rows:
+            continue
+        by_comp: dict[str, list[tuple[str, str]]] = {}
+        for comp_id, atom_id, elem in rows:
+            by_comp.setdefault(comp_id, []).append((atom_id, elem))
+        for comp_id, atoms in by_comp.items():
+            comps.append((comp_id, atoms))
+
+    if not comps:
+        if struct_err is not None:
+            return f"ERROR: {pdb_path.name} has no _atom_site or _chem_comp_atom block ({struct_err})."
+        return f"No atom records found in {pdb_path.name}."
+
+    lines = [f"{pdb_path.name} — restraint dictionary, {len(comps)} monomer(s):"]
+    for comp_id, atoms in comps:
+        sample = ", ".join(f"{a}({e})" for a, e in atoms[:8])
+        more = f", ... ({len(atoms)} atoms)" if len(atoms) > 8 else ""
+        lines.append(f"  comp_id '{comp_id}': {len(atoms)} atoms — {sample}{more}")
+    lines.append(
+        "\nThis is a CCP4 monomer dictionary (no coordinates / chains). "
+        "Load with coot::protein_geometry::init_refmac_mon_lib() or similar."
+    )
+    return "\n".join(lines)
+
+
 def _tool_inspect_pdb(chain: str | None = None, pdb_path: Path | None = None) -> str:
-    """Parse the selected example PDB and summarise its contents.
+    """Parse the selected example PDB/CIF and summarise its contents.
 
     Without 'chain': list chain IDs, residue count, and residue range per chain.
     With 'chain': list every (seq_num, ins_code, res_name) in that chain plus
@@ -1390,22 +1487,27 @@ def _tool_inspect_pdb(chain: str | None = None, pdb_path: Path | None = None) ->
     if not pdb_path.exists():
         return f"ERROR: {pdb_path} not found."
 
-    # chain_id -> list[(seq_num, ins_code, res_name, atom_name)]
     from collections import defaultdict
+    # chain_id -> list[(seq_num, ins_code, res_name, atom_name)]
     records: dict[str, list[tuple[int, str, str, str]]] = defaultdict(list)
 
-    for line in pdb_path.read_text(errors="replace").splitlines():
-        if not line.startswith(("ATOM  ", "HETATM")):
-            continue
-        try:
-            atom_name = line[12:16].strip()
-            res_name  = line[17:20].strip()
-            chain_id  = line[21:22].strip() or "_"
-            seq_num   = int(line[22:26])
-            ins_code  = line[26:27].strip()
-        except (ValueError, IndexError):
-            continue
-        records[chain_id].append((seq_num, ins_code, res_name, atom_name))
+    if pdb_path.suffix.lower() in (".cif", ".mmcif"):
+        cif_summary = _inspect_cif(pdb_path, chain, records)
+        if cif_summary is not None:
+            return cif_summary
+    else:
+        for line in pdb_path.read_text(errors="replace").splitlines():
+            if not line.startswith(("ATOM  ", "HETATM")):
+                continue
+            try:
+                atom_name = line[12:16].strip()
+                res_name  = line[17:20].strip()
+                chain_id  = line[21:22].strip() or "_"
+                seq_num   = int(line[22:26])
+                ins_code  = line[26:27].strip()
+            except (ValueError, IndexError):
+                continue
+            records[chain_id].append((seq_num, ins_code, res_name, atom_name))
 
     if not records:
         return f"No ATOM/HETATM records found in {pdb_path.name}."
