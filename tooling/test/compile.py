@@ -5,69 +5,107 @@ import subprocess
 from pathlib import Path
 
 from ..oracle.compile import (
-    CXX, COOT_API_DIR, COOT_API_NAME, MMDB_API_DIR, MMDB_API_NAME,
-    GEMMI_INCLUDE, CLIPPER_INCLUDE, BOOST_INCLUDE, MMDB_INCLUDE,
-    GSL_INCLUDE, PNG_INCLUDE, GLM_INCLUDE,
+    CXX, COOT_API_DIR, MMDB_API_NAME,
+    AUTOBUILD_LIB, COOT_BUILD_DIR,
+    GEMMI_INCLUDE, CLIPPER_INCLUDE, BOOST_INCLUDE,
+    MMDB_INCLUDE, GSL_INCLUDE, PNG_INCLUDE, GLM_INCLUDE,
+    RDKIT_INCLUDE,
 )
 from ..db import PROJECT_ROOT
 
-GTEST_INCLUDE = "/opt/homebrew/include"
-GTEST_LIB_DIR = "/opt/homebrew/lib"
+AUTOBUILD = "/lmb/home/jdialpuri/autobuild/Linux-hal.lmb.internal"
+GTEST_INCLUDE = f"/lmb/home/jdialpuri/Development/coot-tooling/third-party/google-test/include"
+GTEST_LIB_DIR = f"/lmb/home/jdialpuri/Development/coot-tooling/third-party/google-test/lib"
 
-MAX_COMPILE_ATTEMPTS = 3
+MAX_COMPILE_ATTEMPTS = 20
 
-CXX           = "c++"
-COOT_API_DIR  = "/Users/dialpuri/lmb/build-coot-and-deps"
-COOT_API_NAME = "cootapi"
-MMDB_API_DIR  = "/opt/homebrew/Cellar/mmdb2/2.0.22/lib"
-MMDB_API_NAME = "mmdb2"
-CLIPPER_API_DIR  = "/opt/homebrew/Cellar/clipper4coot/2.1.20180802_3/lib"
-GEMMI_INCLUDE = "/opt/homebrew/opt/gemmi/include"
-CLIPPER_INCLUDE = "/opt/homebrew/Cellar/clipper4coot/2.1.20180802_3/include"
-BOOST_INCLUDE = "/opt/homebrew/Cellar/boost/1.90.0_1/include"
-MMDB_INCLUDE  = "/opt/homebrew/Cellar/mmdb2/2.0.22/include"
-GSL_INCLUDE   = "/opt/homebrew/Cellar/gsl/2.8/include"
-PNG_INCLUDE = "/opt/homebrew/Cellar/libpng/1.6.56/include"
-GLM_INCLUDE = "/opt/homebrew/Cellar/glm/1.0.1/include"
 
 def make_test_compile_cmd(test_cc: Path, output_bin: Path) -> str:
-    includes = [PROJECT_ROOT, GEMMI_INCLUDE, CLIPPER_INCLUDE, BOOST_INCLUDE, MMDB_INCLUDE, GSL_INCLUDE, PNG_INCLUDE, GLM_INCLUDE, GTEST_INCLUDE]
-    includes = " ".join(f'-I"{i}"' for i in includes)
+    includes = " ".join(f'-I"{i}"' for i in [
+        PROJECT_ROOT, GEMMI_INCLUDE, CLIPPER_INCLUDE, BOOST_INCLUDE,
+        MMDB_INCLUDE, GSL_INCLUDE, PNG_INCLUDE, GLM_INCLUDE,
+        RDKIT_INCLUDE, GTEST_INCLUDE,
+    ])
 
-    clipper_libraries = [
-        "clipper-ccp4", "clipper-core", "clipper-cif", "clipper-cns", "clipper-contrib", "clipper-minimol", "clipper-mmdb",
-        "clipper-phs"
-    ]
-    clipper_libraries = " ".join(f'-l{l}' for l in clipper_libraries)
+    clipper_libraries = " ".join(f'-l{l}' for l in [
+        "clipper-core", "clipper-ccp4", "clipper-cif", "clipper-cns",
+        "clipper-contrib", "clipper-minimol", "clipper-mmdb", "clipper-phs",
+    ])
+    rdkit_libraries = " ".join(f'-lRDKit{l}' for l in [
+        "GraphMol", "SmilesParse", "FileParsers", "RDGeneral",
+        "RDStreams", "RDGeometryLib", "SubstructMatch", "Depictor",
+        "MolTransforms", "RDInchiLib",
+    ])
 
     return (
-        f'{CXX} -std=c++17 "{test_cc.absolute()}" -o "{output_bin.absolute()}" '
+        f'{CXX} -std=c++20 -fno-access-control "{test_cc.absolute()}" -o "{output_bin.absolute()}" '
         f'{includes} '
-        f'-pthread '
-        f'-Wl,-rpath,{COOT_API_DIR} '
-        f'-L "{COOT_API_DIR}" -l{COOT_API_NAME} '
-        f'-L "{MMDB_API_DIR}" -l{MMDB_API_NAME} '
-        f'-L "{CLIPPER_API_DIR}" {clipper_libraries} '
-        f'-L "{GTEST_LIB_DIR}" -lgtest -lgtest_main '
+        f'-Wl,-rpath,{AUTOBUILD_LIB} '
+        f'-Wl,-rpath,{COOT_BUILD_DIR} '
+        f'-L "{COOT_BUILD_DIR}" -lcootapi '
+        f'-L "{AUTOBUILD_LIB}" {clipper_libraries} {rdkit_libraries} -l{MMDB_API_NAME} -lstdc++ '
+        f'-L "{GTEST_LIB_DIR}" -lgtest -lgtest_main -lm -no-pie'
     )
+
 
 
 def compile_test_cc(test_cc: Path, output_bin: Path) -> tuple[bool, str]:
     """Compile test_cc. Returns (success, compiler output)."""
     cmd = make_test_compile_cmd(test_cc, output_bin)
-    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                          cwd=str(test_cc.parent))
+
+    script = output_bin.parent / "compile.sh"
+    script.write_text(f"#!/bin/sh\nset -e\n{cmd}\n")
+    script.chmod(0o755)
+    try:
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                              cwd=str(test_cc.parent), timeout=180)
+    except subprocess.TimeoutExpired:
+        return False, "[compile_test_cc] timed out after 180s"
     return proc.returncode == 0, (proc.stdout + proc.stderr).strip()
 
 
-def run_test_binary(test_bin: Path) -> tuple[bool, str]:
-    """Run a compiled test binary. Returns (all tests passed, output)."""
-    proc = subprocess.run(
-        [str(test_bin.absolute())],
-        capture_output=True, text=True,
-        cwd=str(test_bin.parent),
+def _spawn_and_wait(cmd: list[str], cwd: str, timeout: int) -> tuple[int | None, str, str]:
+    """Spawn cmd in its own process group, wait up to timeout. Returns
+    (returncode, stdout, stderr); returncode is None on timeout."""
+    import os
+    import signal
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cwd=cwd, start_new_session=True,
     )
-    return proc.returncode == 0, (proc.stdout + proc.stderr).strip()
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return proc.returncode, stdout, stderr
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        return None, "", ""
+
+
+def run_test_binary(test_bin: Path, attempts: int = 2) -> tuple[bool, str]:
+    """Run a compiled test binary. Returns (all tests passed, output).
+
+    Retries once on timeout — the hang is non-deterministic and a fresh
+    invocation usually completes in milliseconds.
+    """
+    cmd = ["stdbuf", "-oL", "-eL", str(test_bin.absolute())]
+    cwd = str(test_bin.parent)
+    last_out = ""
+    for attempt in range(1, attempts + 1):
+        rc, stdout, stderr = _spawn_and_wait(cmd, cwd, timeout=20)
+        if rc is None:
+            last_out = f"[run_test_binary] timed out after 20s (attempt {attempt}/{attempts})"
+            continue
+        try:
+            (test_bin.parent / "run.exit").write_text(str(rc))
+        except OSError:
+            pass
+        return rc == 0, (stdout + stderr).strip()
+    return False, last_out
 
 
 def write_compile_script(test_subdir: Path) -> Path:
