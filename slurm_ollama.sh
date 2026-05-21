@@ -65,7 +65,7 @@ for PORT in \$PORTS_STR; do
     fi
     tmux send-keys -t "\$SESH:ollama.\$PANE" "ssh -L 127.0.0.1:\${PORT}:localhost:\${PORT} \$NODE" C-m
     sleep 1
-    tmux send-keys -t "\$SESH:ollama.\$PANE" "OLLAMA_HOST=0.0.0.0:\$PORT \$OLLAMA_CMD" C-m
+    tmux send-keys -t "\$SESH:ollama.\$PANE" "CUDA_VISIBLE_DEVICES=\$PANE OLLAMA_HOST=0.0.0.0:\$PORT \$OLLAMA_CMD" C-m
     PANE=\$((PANE + 1))
 done
 tmux select-layout -t "\$SESH:ollama" even-vertical
@@ -87,7 +87,10 @@ tmux send-keys -t "$SESH:setup" "bash $SETUP_SCRIPT" C-m
 tmux send-keys -t "$SESH:srun" "$SRUN_CMD" C-m
 
 # ── batch: activate venv and run batch job ────────────────────────────────────
-tmux send-keys -t "$SESH:batch" "cd $SCRIPT_DIR && source .venv/bin/activate && OLLAMA_HOSTS=$HOSTS_CSV $BATCH_CMD" C-m
+tmux send-keys -t "$SESH:batch" "cd $SCRIPT_DIR" C-m
+tmux send-keys -t "$SESH:batch" "source .venv/bin/activate" C-m
+tmux send-keys -t "$SESH:batch" "ml compilers/llvm" C-m
+tmux send-keys -t "$SESH:batch" "OLLAMA_HOSTS=$HOSTS_CSV $BATCH_CMD" 
 
 # ── Attach immediately so you can watch everything unfold ─────────────────────
 tmux select-window -t "$SESH:setup"
