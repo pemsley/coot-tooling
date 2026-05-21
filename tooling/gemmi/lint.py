@@ -43,11 +43,20 @@ _PATTERNS: list[tuple[str, str]] = [
     (r"\b(?:st|structure)\s*\.\s*links\b",
      "gemmi::Structure field is `connections` (std::vector<Connection>), "
      "not `links`."),
-    # NOTE: ResidueId.num and Fractional.u/v/w are agent failures we'd love to
-    # catch, but they require type tracking ("variable f is a Fractional, so
-    # f.u is wrong"). A regex can't do this reliably without false positives,
-    # so we surface them in the prose anti-pattern catalog (system prompt)
-    # instead and let compile errors catch the rest.
+    # NOTE: the following are real agent failures (seen in the compile-fail
+    # corpus) that we deliberately DON'T regex, because catching them needs
+    # variable-type tracking and a blind pattern would flag valid code. They
+    # belong in the prose anti-pattern catalog (system prompt) instead:
+    #   • ResidueId.num / ResidueId.chain — the seq number is `res.seqid.num`
+    #     (an OptionalInt, `.num.value`); ResidueId has no `chain`.
+    #   • Fractional.u/v/w — Fractional/Position are Vec3, fields are x/y/z.
+    #   • cif::Loop.data / cif::Loop.find_value — Loop stores `tags` +
+    #     flat `values`; read with `loop.val(row, col)` / `loop.find_tag(tag)`.
+    #     `find_value` is real but lives on cif::Block, not cif::Loop — so a
+    #     blanket `.find_value` rule would flag the valid Block call.
+    #   • Atom.altLoc — gemmi's field is `altloc` (lowercase, a single char),
+    #     but coot's own `minimol::atom::altLoc` is a legit member, so a bare
+    #     `.altLoc` rule false-positives on minimol ports.
     # ApplyTransform / mat44 are MMDB names; flag if they leak into gemmi code.
     (r"\bgemmi::mat44\b",
      "gemmi has no mat44 — use gemmi::Transform (Mat33 + Vec3) "
@@ -73,6 +82,55 @@ _PATTERNS: list[tuple[str, str]] = [
      "subchain is gemmi's polymer/entity label (e.g. \"Axp\"), not the chain "
      "ID. Compare against the parent `Chain::name` instead (carry it via a "
      "`gemmi::CRA` or alongside the Residue*)."),
+    # ── batch-mined 2026-05-21: header-verified, 0 false positives across the
+    #    329 passing ports in generated-tests/. Each fired in the compile-fail
+    #    corpus; replacements checked against ~/gemmi/include/gemmi.
+    # gemmi::Atom has no parent back-pointer (unlike mmdb::Atom::residue).
+    (r"\batom\s*(?:->|\.)\s*(?:residue|parent_residue|parent)\b",
+     "gemmi::Atom has no parent pointer — there is no `atom.residue` / "
+     "`atom.parent` / `atom.parent_residue`. Carry parent context with a "
+     "`gemmi::CRA{Chain*, Residue*, Atom*}`, or pair Chain*/Residue*/Atom* "
+     "during nested iteration "
+     "(`for (auto& ch : model.chains) for (auto& res : ch.residues) "
+     "for (auto& at : res.atoms)`)."),
+    # Connection endpoints are partner1/partner2, not a `partners` container.
+    (r"(?:->|\.)partners\b",
+     "gemmi::Connection has no `partners` member — the two endpoints are "
+     "`partner1` and `partner2` (each a `gemmi::AtomAddress`)."),
+    # connections live on Structure, not Model.
+    (r"(?:model|mdl)\s*(?:->|\.)\s*connections\b",
+     "gemmi::Model has no `connections` — LINK/SSBOND connections live on "
+     "`gemmi::Structure::connections` (std::vector<Connection>), not on Model."),
+    # Element placeholder test: there's no is_dummy().
+    (r"(?:element|elem|el)\s*(?:->|\.)\s*is_dummy\s*\(",
+     "gemmi::Element has no is_dummy() — the unknown/placeholder element is "
+     "`gemmi::El::X`; test with `el == gemmi::El::X` (Element compares against "
+     "El). #include <gemmi/elem.hpp>."),
+    # I/O free-function name slips.
+    (r"\bgemmi::read_cif_file\b",
+     "gemmi::read_cif_file doesn't exist — read a CIF document with "
+     "`gemmi::cif::read_file(path)` (#include <gemmi/cif.hpp>), or read a "
+     "model with `gemmi::read_structure` (#include <gemmi/mmread.hpp>)."),
+    (r"\bgemmi::write_pdb_file\b",
+     "gemmi::write_pdb_file doesn't exist — use "
+     "`gemmi::write_pdb(structure, std::ostream&)` (#include <gemmi/to_pdb.hpp>)."),
+    (r"\bgemmi::to_mmcif\b",
+     "gemmi has no `gemmi::to_mmcif` — build an mmCIF document with "
+     "`gemmi::make_mmcif_document(structure)` (#include <gemmi/to_mmcif.hpp>), "
+     "then write it (`doc.write_file(path)`)."),
+    # Geometry: dihedral is a free function; length/distance are methods.
+    (r"\bgemmi::dihedral\s*\(",
+     "gemmi::dihedral doesn't exist — use "
+     "`gemmi::calculate_dihedral(p0, p1, p2, p3)` (four gemmi::Position, "
+     "#include <gemmi/calculate.hpp>), or "
+     "`gemmi::calculate_dihedral_from_atoms(a, b, c, d)`."),
+    (r"\bgemmi::length\s*\(",
+     "gemmi::length is not a free function — `length()` is a method: "
+     "`v.length()` on a gemmi::Vec3/gemmi::Position (#include <gemmi/math.hpp>)."),
+    (r"\bgemmi::distance\s*\(",
+     "gemmi::distance doesn't exist — distance is a method: `p1.dist(p2)` on "
+     "a gemmi::Position/gemmi::Vec3. For periodic distances use "
+     "`UnitCell::find_nearest_image`."),
 ]
 
 
@@ -99,6 +157,10 @@ _SYMBOL_HEADERS: list[tuple[str, str]] = [
     (r"\bgemmi::Grid\b",               "<gemmi/grid.hpp>"),
     (r"\bgemmi::DsspCalculator\b",     "<gemmi/dssp.hpp>"),
     (r"\bgemmi::make_assembly\b",      "<gemmi/assembly.hpp>"),
+    (r"\bgemmi::SmallStructure\b",     "<gemmi/small.hpp>"),
+    (r"\bgemmi::make_mmcif_document\b", "<gemmi/to_mmcif.hpp>"),
+    (r"\bgemmi::calculate_dihedral\b", "<gemmi/calculate.hpp>"),
+    (r"\bgemmi::calculate_angle\b",    "<gemmi/calculate.hpp>"),
     (r"\bTEST\s*\(",                   "<gtest/gtest.h>"),
     (r"\bEXPECT_(?:EQ|NE|TRUE|FALSE|FLOAT_EQ|DOUBLE_EQ|NEAR|LT|LE|GT|GE)\b",
                                        "<gtest/gtest.h>"),
