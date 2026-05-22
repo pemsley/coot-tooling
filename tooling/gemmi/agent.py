@@ -116,24 +116,46 @@ def _coot_callees(conn: sqlite3.Connection, caller_qname: str) -> list[str]:
     return [r[0] for r in rows]
 
 
-def _has_gemmi_port(callee_qname: str) -> bool:
-    """True if a verified `_gemmi` port exists for `callee_qname`.
+def _gemmi_port_passed(port_dir: Path) -> bool:
+    """True only if the port in `port_dir` compiled AND its test passed.
 
-    `function.hh` is only written by `generate.py` after compile+run both
-    pass, so its presence is the reliable success signal — see
-    `tooling/gemmi/generate.py:_write_files`. When the callee is overloaded
-    we have one dir per overload (`<sanitized>__<sig>/`); ANY of them
-    counting as ported is enough for downstream code that just needs the
+    `function.hh` presence alone is NOT a success signal: the agent's
+    `write_gemmi_file` tool writes function.hh mid-session, so a FAILED port
+    (e.g. one that declared a `_gemmi` helper but never defined it) leaves a
+    function.hh behind. Offering such a dir as a dependency makes callers
+    forward-declare and call a symbol that exists nowhere → undefined
+    reference at link. We therefore require the same authoritative pass
+    marker batch.py uses: `gemmi/run.exit == "0"`, falling back to a
+    `[  PASSED  ]` line in run.log for legacy runs without the sidecar.
+    """
+    gemmi_dir = port_dir / "gemmi"
+    if not (gemmi_dir / "function.hh").is_file():
+        return False
+    run_exit = gemmi_dir / "run.exit"
+    if run_exit.is_file():
+        return run_exit.read_text().strip() == "0"
+    run_log = gemmi_dir / "run.log"
+    if run_log.is_file():
+        return "[  PASSED  ]" in run_log.read_text(errors="replace")
+    return False
+
+
+def _has_gemmi_port(callee_qname: str) -> bool:
+    """True if a PASSING `_gemmi` port exists for `callee_qname`.
+
+    Gated on `_gemmi_port_passed` rather than mere function.hh existence so
+    callers are never told to depend on a failed/incomplete port. When the
+    callee is overloaded we have one dir per overload (`<sanitized>__<sig>/`);
+    ANY of them passing is enough for downstream code that just needs the
     symbol to be linkable.
     """
-    return any((d / "gemmi" / "function.hh").is_file()
-               for d in find_function_dirs(callee_qname))
+    return any(_gemmi_port_passed(d) for d in find_function_dirs(callee_qname))
 
 
 def _gemmi_port_dirs(callee_qname: str) -> list[Path]:
-    """Every per-overload output dir that has a verified gemmi port."""
+    """Every per-overload output dir that has a PASSING gemmi port."""
     return [d for d in find_function_dirs(callee_qname)
-            if (d / "gemmi" / "function.hh").is_file()]
+            if _gemmi_port_passed(d)]
 
 
 def _gemmi_target_name(qname: str) -> str:
@@ -147,8 +169,9 @@ def _gemmi_target_name(qname: str) -> str:
 def _all_gemmi_ports(conn: sqlite3.Connection) -> list[str]:
     """Return all coot qualified names that have a verified gemmi port.
 
-    A port is "verified" when `<sanitized>[__<sig>]/gemmi/function.hh`
-    exists — see `_has_gemmi_port`. `sanitize_name` is lossy AND overloads
+    A port counts only when it PASSED (`gemmi/run.exit == "0"`), not merely
+    when `function.hh` exists — see `_gemmi_port_passed`. `sanitize_name` is
+    lossy AND overloads
     add a `__<sig>` suffix; we strip the suffix before mapping back to the
     DB's distinct qualified_name set. Multiple overload dirs for the same
     qname collapse to a single returned qname.
@@ -156,6 +179,7 @@ def _all_gemmi_ports(conn: sqlite3.Connection) -> list[str]:
     ported_dir_names = {
         p.parent.parent.name
         for p in OUT_ROOT.glob("*/gemmi/function.hh")
+        if _gemmi_port_passed(p.parent.parent)
     }
     if not ported_dir_names:
         return []
