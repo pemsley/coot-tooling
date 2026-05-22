@@ -25,7 +25,7 @@ PDB_CATALOG: dict[str, str] = {
     "example-hydrogen.pdb": (
         "protein with explicit hydrogen atoms added"
     ),
-    "example-ligand.pdb": (
+    "example-ligand.cif": (
         "small-molecule ligand only (no protein), for restraint generation / rdkit / SMILES workflows"
     ),
     "example-protein-ligand.cif": (
@@ -68,7 +68,7 @@ _KEYWORD_MAP: list[tuple[list[str], str]] = [
             "dictionary_entry", "cif_dictionary", "mogul",
             "acedrg", "ligand_builder",
         ],
-        "example-ligand.pdb",
+        "example-ligand.cif",
     ),
 ]
 
@@ -77,7 +77,10 @@ _KEYWORD_MAP: list[tuple[list[str], str]] = [
 # to suppress the note for that file.
 _PDB_NOTES: dict[str, str] = {
     "example-protein-ligand.cif": (
-        "The ligand LZA (residue 1299, chain A) is the bound small molecule of interest."
+        "The ligand LZA (residue 1299, chain A) is the bound small molecule of interest. Use it in tests."
+    ),
+    "example-ligand.cif": (
+        "The ligand LZA. Use it in tests."
     ),
 }
 
